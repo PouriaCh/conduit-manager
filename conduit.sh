@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ╔═══════════════════════════════════════════════════════════════════╗
-# ║        🚀 PSIPHON CONDUIT MANAGER v1.0.2                          ║
+# ║        🚀 PSIPHON CONDUIT MANAGER v1.0.2-Mac                      ║
 # ║                                                                   ║
 # ║  One-click setup for Psiphon Conduit                              ║
 # ║                                                                   ║
@@ -31,10 +31,12 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
-VERSION="1.0.2"
-CONDUIT_IMAGE="ghcr.io/ssmirr/conduit/conduit:d8522a8"
+VERSION="1.0.2-Mac"
+CONDUIT_IMAGE="ghcr.io/ssmirr/conduit/conduit:latest"
 INSTALL_DIR="${INSTALL_DIR:-/opt/conduit}"
-BACKUP_DIR="$INSTALL_DIR/backups"
+# BACKUP_DIR depends on INSTALL_DIR and may be overridden during OS detection (e.g. macOS).
+BACKUP_DIR=""
+STATS_FILE="/home/conduit/data/conduit_stats.json"
 FORCE_REINSTALL=false
 
 # Colors
@@ -53,9 +55,21 @@ NC='\033[0m'
 print_header() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════╗"
-    echo "║                🚀 PSIPHON CONDUIT MANAGER v${VERSION}                  ║"
+    local inner_width=67
+    local title="🚀  PSIPHON CONDUIT MANAGER v${VERSION}"
+    local title_len=${#title}
+    local emoji_width=0
+    if [[ "$title" == *"🚀"* ]]; then
+        emoji_width=1
+    fi
+    local visible_len=$((title_len + emoji_width))
+    local pad_total=$((inner_width - visible_len))
+    [ "$pad_total" -lt 0 ] && pad_total=0
+    local pad_left=$((pad_total / 2))
+    local pad_right=$((pad_total - pad_left))
+    printf "║%*s%s%*s║\n" "$pad_left" "" "$title" "$pad_right" ""
     echo "╠═══════════════════════════════════════════════════════════════════╣"
-    echo "║  Help users access the open internet during shutdowns             ║"
+    echo "║       Help users access the open internet during shutdowns        ║"
     echo "╚═══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -77,6 +91,22 @@ log_error() {
 }
 
 check_root() {
+    # On macOS we support user installs (no root) by default, and we *avoid* sudo because Homebrew
+    # refuses to run as root.
+    if [ "${OS_FAMILY:-unknown}" = "macos" ]; then
+        if [ "$EUID" -eq 0 ]; then
+            log_error "Do not run this script with sudo on macOS."
+            log_info "Homebrew will refuse to install packages as root."
+            log_info "Run it like this instead:"
+            log_info "  bash $0"
+            log_info ""
+            log_info "If you downloaded via curl, remove sudo:"
+            log_info "  curl -sL https://raw.githubusercontent.com/SamNet-dev/conduit-manager/main/conduit.sh | bash"
+            exit 1
+        fi
+        return 0
+    fi
+
     if [ "$EUID" -ne 0 ]; then
         log_error "This script must be run as root (use sudo)"
         exit 1
@@ -91,7 +121,13 @@ detect_os() {
     PKG_MANAGER="unknown"
     
     # Detect OS from /etc/os-release
-    if [ -f /etc/os-release ]; then
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        OS="macos"
+        OS_FAMILY="macos"
+        OS_VERSION="$(sw_vers -productVersion 2>/dev/null || echo "unknown")"
+        PKG_MANAGER="brew"
+        HAS_SYSTEMD=false
+    elif [ -f /etc/os-release ]; then
         . /etc/os-release
         OS="$ID"
         OS_VERSION="${VERSION_ID:-unknown}"
@@ -111,6 +147,10 @@ detect_os() {
     
     # Determine OS family and package manager
     case "$OS" in
+        macos)
+            OS_FAMILY="macos"
+            PKG_MANAGER="brew"
+            ;;
         ubuntu|debian|linuxmint|pop|elementary|zorin|kali|raspbian)
             OS_FAMILY="debian"
             PKG_MANAGER="apt"
@@ -145,6 +185,12 @@ detect_os() {
     if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
         HAS_SYSTEMD=true
     fi
+
+    # macOS default install dir: avoid requiring sudo for /opt
+    if [ "$OS_FAMILY" = "macos" ] && [ "$INSTALL_DIR" = "/opt/conduit" ]; then
+        INSTALL_DIR="$HOME/.conduit"
+    fi
+    BACKUP_DIR="$INSTALL_DIR/backups"
     
     log_info "Detected: $OS ($OS_FAMILY family), Package manager: $PKG_MANAGER"
 
@@ -154,11 +200,60 @@ detect_os() {
     fi
 }
 
+ensure_install_dir_writable() {
+    # On macOS we aim for a fully non-sudo install. If a previous sudo run created a root-owned
+    # directory (common), fall back to a user-writable install dir automatically.
+    if [ "$OS_FAMILY" != "macos" ]; then
+        return 0
+    fi
+
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+
+    if [ -w "$INSTALL_DIR" ]; then
+        return 0
+    fi
+
+    log_warn "Install directory is not writable: $INSTALL_DIR"
+    log_warn "This usually happens if you previously ran the installer with sudo."
+
+    local fallback_dir="$HOME/.conduit-user"
+    log_info "Switching to a user-writable install directory: $fallback_dir"
+    INSTALL_DIR="$fallback_dir"
+    BACKUP_DIR="$INSTALL_DIR/backups"
+
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+    if [ ! -w "$INSTALL_DIR" ]; then
+        log_error "Install directory is still not writable: $INSTALL_DIR"
+        log_info "Please fix permissions or choose a different INSTALL_DIR."
+        log_info "Example (fix old dir ownership):"
+        log_info "  sudo chown -R \"$(id -u):$(id -g)\" \"$HOME/.conduit\""
+        exit 1
+    fi
+}
+
 install_package() {
     local package="$1"
     log_info "Installing $package..."
     
     case "$PKG_MANAGER" in
+        brew)
+            if [ "$EUID" -eq 0 ]; then
+                log_error "Homebrew cannot be run as root on macOS."
+                log_info "Please rerun without sudo."
+                return 1
+            fi
+            if ! command -v brew &>/dev/null; then
+                log_error "Homebrew is required on macOS to install dependencies."
+                log_info "Install Homebrew from: https://brew.sh/"
+                return 1
+            fi
+            if brew install "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package via Homebrew"
+                return 1
+            fi
+            ;;
         apt)
             # Make update failure non-fatal but log it
             apt-get update -q || log_warn "apt-get update failed, attempting to install regardless..."
@@ -229,6 +324,20 @@ check_dependencies() {
     if ! command -v curl &>/dev/null; then
         install_package curl || log_warn "Could not install curl automatically"
     fi
+
+    # macOS: ensure modern bash (system bash is 3.2 without associative arrays)
+    if [ "$OS_FAMILY" = "macos" ]; then
+        local bash_path
+        bash_path=$(command -v bash || true)
+        local bash_major=0
+        if [ -n "$bash_path" ]; then
+            bash_major=$(bash -c 'ver=${BASH_VERSINFO[0]:-0}; echo "${ver:-0}"' 2>/dev/null || echo 0)
+        fi
+        if [ "$bash_major" -lt 4 ]; then
+            log_info "Installing modern bash via Homebrew (required for associative arrays)..."
+            install_package bash || log_warn "Could not install modern bash; macOS peers view may fail"
+        fi
+    fi
     
     # Check for basic tools
     if ! command -v awk &>/dev/null; then
@@ -239,8 +348,8 @@ check_dependencies() {
         esac
     fi
     
-    # Check for free command
-    if ! command -v free &>/dev/null; then
+    # Check for free command (Linux). On macOS we use other methods for RAM stats.
+    if [ "$OS_FAMILY" != "macos" ] && ! command -v free &>/dev/null; then
         case "$PKG_MANAGER" in
             apt|dnf|yum) install_package procps || log_warn "Could not install procps" ;;
             pacman) install_package procps-ng || log_warn "Could not install procps" ;;
@@ -266,6 +375,19 @@ check_dependencies() {
     # Check for GeoIP tools
     if ! command -v geoiplookup &>/dev/null; then
         case "$PKG_MANAGER" in
+            brew)
+                # macOS: implement GeoIP via DB-IP Lite MMDB + mmdblookup (libmaxminddb)
+                if ! command -v mmdblookup &>/dev/null; then
+                    install_package libmaxminddb || {
+                        log_error "GeoIP lookup is required for peers-by-country on macOS."
+                        log_error "Failed to install libmaxminddb (mmdblookup)."
+                        exit 1
+                    }
+                fi
+
+                # Ensure DB-IP Lite Country DB is present (optional unless peers-by-country is used)
+                ensure_geoip_db_macos
+                ;;
             apt) 
                 # geoip-bin and geoip-database for newer systems
                 install_package geoip-bin || log_warn "Could not install geoip-bin"
@@ -287,9 +409,181 @@ check_dependencies() {
     fi
 }
 
+ensure_geoip_db_macos() {
+    # Ensure DB-IP Lite Country DB exists for mmdblookup.
+    # Optional unless peers-by-country is used.
+    if [ "$OS_FAMILY" != "macos" ]; then
+        return 0
+    fi
+
+    local geoip_dir="$INSTALL_DIR/geoip"
+    local mmdb_path="$geoip_dir/dbip-country-lite.mmdb"
+    mkdir -p "$geoip_dir"
+
+    if [ -f "$mmdb_path" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                 GEOIP DATABASE (macOS)                         ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "To show peers by country on macOS, we use the free DB-IP Lite Country database."
+    echo "No account or license key is required."
+    echo ""
+    echo -e "  Source: ${YELLOW}https://db-ip.com/db/ip-to-country-lite${NC}"
+    echo ""
+    read -p "Download DB-IP Lite database now? [y/N] " geoip_confirm < /dev/tty || true
+    if [[ ! "$geoip_confirm" =~ ^[Yy] ]]; then
+        log_warn "Skipping GeoIP database setup."
+        log_info "You can rerun the installer later to enable peers-by-country on macOS."
+        return 0
+    fi
+
+    log_info "Downloading DB-IP Lite Country database..."
+    local tmpdir
+    tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t conduit_geoip)"
+    local download_path="$tmpdir/dbip-country-lite.mmdb.gz"
+    local download_ok=0
+    local year_month=""
+    local url=""
+
+    year_month="$(date +%Y-%m 2>/dev/null || echo "")"
+    if [ -n "$year_month" ]; then
+        url="https://download.db-ip.com/free/dbip-country-lite-${year_month}.mmdb.gz"
+        if curl -fL -sS "$url" -o "$download_path"; then
+            download_ok=1
+        fi
+    fi
+
+    if [ "$download_ok" -ne 1 ]; then
+        local prev_year_month=""
+        if date -v -1m +%Y-%m >/dev/null 2>&1; then
+            prev_year_month="$(date -v -1m +%Y-%m 2>/dev/null || echo "")"
+        elif date -d "1 month ago" +%Y-%m >/dev/null 2>&1; then
+            prev_year_month="$(date -d "1 month ago" +%Y-%m 2>/dev/null || echo "")"
+        fi
+        if [ -n "$prev_year_month" ]; then
+            url="https://download.db-ip.com/free/dbip-country-lite-${prev_year_month}.mmdb.gz"
+            if curl -fL -sS "$url" -o "$download_path"; then
+                download_ok=1
+            fi
+        fi
+    fi
+
+    if [ "$download_ok" -ne 1 ]; then
+        log_error "Failed to download DB-IP Lite database."
+        rm -rf "$tmpdir" 2>/dev/null || true
+        log_warn "Skipping GeoIP database setup."
+        return 0
+    fi
+
+    local extracted_mmdb="$tmpdir/dbip-country-lite.mmdb"
+    local file_type=""
+    if command -v file &>/dev/null; then
+        file_type="$(file -b "$download_path" 2>/dev/null || true)"
+    fi
+
+    if [ -z "$file_type" ] && command -v od &>/dev/null; then
+        local magic
+        magic="$(od -An -t x1 -N 4 "$download_path" 2>/dev/null | tr -d ' \n')"
+        case "$magic" in
+            504b0304) file_type="zip" ;;
+            1f8b08*) file_type="gzip" ;;
+            3c21444f|3c68746d) file_type="html" ;;
+        esac
+    fi
+
+    case "$file_type" in
+        *HTML*|*html*)
+            log_error "Download did not return a database file (HTML response)."
+            rm -rf "$tmpdir" 2>/dev/null || true
+            log_warn "Skipping GeoIP database setup."
+            return 0
+            ;;
+        *gzip*|*GZIP*|*gz*)
+            if ! command -v gzip &>/dev/null; then
+                log_error "Gzip archive detected but gzip is not available."
+                rm -rf "$tmpdir" 2>/dev/null || true
+                log_warn "Skipping GeoIP database setup."
+                return 0
+            fi
+            if ! gzip -dc "$download_path" > "$extracted_mmdb" 2>/dev/null; then
+                log_error "Failed to extract DB-IP Lite gzip archive."
+                rm -rf "$tmpdir" 2>/dev/null || true
+                log_warn "Skipping GeoIP database setup."
+                return 0
+            fi
+            ;;
+        *Zip*|*zip*)
+            if command -v unzip &>/dev/null; then
+                if ! unzip -p "$download_path" "*.mmdb" > "$extracted_mmdb" 2>/dev/null; then
+                    log_error "Failed to extract DB-IP Lite zip archive."
+                    rm -rf "$tmpdir" 2>/dev/null || true
+                    log_warn "Skipping GeoIP database setup."
+                    return 0
+                fi
+            elif command -v python3 &>/dev/null; then
+                if ! python3 - "$download_path" "$extracted_mmdb" <<'PY'
+import sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as z:
+    for name in z.namelist():
+        if name.lower().endswith(".mmdb"):
+            with z.open(name) as f, open(dst, "wb") as out:
+                out.write(f.read())
+            sys.exit(0)
+sys.exit(1)
+PY
+                then
+                    log_error "Failed to extract DB-IP Lite zip archive."
+                    rm -rf "$tmpdir" 2>/dev/null || true
+                    log_warn "Skipping GeoIP database setup."
+                    return 0
+                fi
+            else
+                log_error "Zip archive detected but unzip/python3 not available."
+                rm -rf "$tmpdir" 2>/dev/null || true
+                log_warn "Skipping GeoIP database setup."
+                return 0
+            fi
+            ;;
+        *)
+            # Assume direct MMDB download
+            cp "$download_path" "$extracted_mmdb" 2>/dev/null || true
+            ;;
+    esac
+
+    if [ ! -f "$extracted_mmdb" ]; then
+        log_error "DB-IP Lite MMDB not found in downloaded archive."
+        rm -rf "$tmpdir" 2>/dev/null || true
+        log_warn "Skipping GeoIP database setup."
+        return 0
+    fi
+
+    if ! cp "$extracted_mmdb" "$mmdb_path"; then
+        log_error "Failed to install GeoIP database to: $mmdb_path"
+        rm -rf "$tmpdir" 2>/dev/null || true
+        log_warn "Skipping GeoIP database setup."
+        return 0
+    fi
+
+    rm -rf "$tmpdir" 2>/dev/null || true
+    log_success "GeoIP database installed: $mmdb_path"
+}
+
 get_ram_mb() {
     # Get RAM in MB
     local ram=""
+
+    # macOS
+    if [ "$OS_FAMILY" = "macos" ]; then
+        local bytes=$(sysctl -n hw.memsize 2>/dev/null || echo "")
+        if [[ "$bytes" =~ ^[0-9]+$ ]] && [ "$bytes" -gt 0 ] 2>/dev/null; then
+            ram=$((bytes / 1024 / 1024))
+        fi
+    fi
     
     # Try free command first
     if command -v free &>/dev/null; then
@@ -316,7 +610,9 @@ get_ram_mb() {
 
 get_cpu_cores() {
     local cores=1
-    if command -v nproc &>/dev/null; then
+    if [ "$OS_FAMILY" = "macos" ]; then
+        cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    elif command -v nproc &>/dev/null; then
         cores=$(nproc)
     elif [ -f /proc/cpuinfo ]; then
         cores=$(grep -c ^processor /proc/cpuinfo)
@@ -453,6 +749,31 @@ install_docker() {
     fi
     
     log_info "Installing Docker..."
+
+    # macOS (Apple Silicon): prefer Docker Desktop
+    if [ "$OS_FAMILY" = "macos" ]; then
+        echo ""
+        log_warn "macOS detected. Docker Engine runs via Docker Desktop on macOS."
+        echo -e "${YELLOW}Note:${NC} This script supports Apple Silicon (arm64) Macs."
+        echo ""
+
+        if ! command -v brew &>/dev/null; then
+            log_error "Homebrew not found. Please install Docker Desktop manually."
+            log_info "Install Homebrew: https://brew.sh/"
+            log_info "Or install Docker Desktop: https://www.docker.com/products/docker-desktop/"
+            return 1
+        fi
+
+        log_info "Installing Docker Desktop (Homebrew cask)..."
+        if brew install --cask docker; then
+            log_success "Docker Desktop installed"
+            return 0
+        else
+            log_error "Failed to install Docker Desktop via Homebrew."
+            log_info "Please install it manually: https://www.docker.com/products/docker-desktop/"
+            return 1
+        fi
+    fi
     
     # Check OS family for specific requirements
     if [ "$OS_FAMILY" = "rhel" ]; then
@@ -505,6 +826,83 @@ install_docker() {
         log_error "Docker installation may have failed. Please check manually."
         return 1
     fi
+}
+
+ensure_docker_running() {
+    # Ensures Docker CLI exists AND Docker Engine (daemon) is reachable.
+    # If daemon isn't running, prompts user for permission to start it; otherwise exits with an explicit message.
+
+    if ! command -v docker &>/dev/null; then
+        log_error "Docker is not installed (docker command not found)."
+        log_error "Please install Docker and rerun this script."
+        exit 1
+    fi
+
+    # Fast path: daemon already running
+    if docker info &>/dev/null; then
+        return 0
+    fi
+
+    log_warn "Docker is installed but the Docker Engine (daemon) is not running."
+    echo ""
+    echo -e "${CYAN}Docker is required to continue.${NC}"
+    if [ "$OS_FAMILY" = "macos" ]; then
+        echo -e "Docker Desktop needs to be running."
+        echo -e "This script can try to open Docker Desktop for you."
+    else
+        echo -e "This script can try to start the Docker service for you."
+    fi
+    echo ""
+    read -p "Start Docker Engine now? [y/N] " start_docker_confirm < /dev/tty || true
+
+    if [[ ! "$start_docker_confirm" =~ ^[Yy] ]]; then
+        echo ""
+        log_error "Docker Engine is not running. Cannot continue without Docker."
+        log_info "Start it manually, then rerun this script."
+        if [ "$OS_FAMILY" = "macos" ]; then
+            log_info "  Open Docker Desktop (Applications → Docker)"
+        else
+            log_info "  systemd:   sudo systemctl start docker"
+            log_info "  SysVinit:  sudo service docker start   (or /etc/init.d/docker start)"
+            log_info "  OpenRC:    sudo rc-service docker start"
+        fi
+        exit 1
+    fi
+
+    echo ""
+    log_info "Starting Docker..."
+
+    if [ "$OS_FAMILY" = "macos" ]; then
+        # Docker Desktop (macOS)
+        open -a Docker 2>/dev/null || true
+    elif [ "$HAS_SYSTEMD" = "true" ]; then
+        systemctl start docker 2>/dev/null || true
+    else
+        # OpenRC / SysVinit fallbacks
+        service docker start 2>/dev/null || true
+        /etc/init.d/docker start 2>/dev/null || true
+        rc-service docker start 2>/dev/null || true
+    fi
+
+    # Wait briefly for daemon readiness
+    local retries=120
+    while ! docker info &>/dev/null && [ $retries -gt 0 ]; do
+        sleep 1
+        retries=$((retries - 1))
+    done
+
+    if docker info &>/dev/null; then
+        log_success "Docker Engine is running"
+        return 0
+    fi
+
+    log_error "Docker Engine is not running (cannot connect to the Docker daemon)."
+    log_error "Please start Docker, then rerun this script."
+    log_info "Common commands:"
+    log_info "  systemd:   sudo systemctl start docker"
+    log_info "  SysVinit:  sudo service docker start   (or /etc/init.d/docker start)"
+    log_info "  OpenRC:    sudo rc-service docker start"
+    exit 1
 }
 
 
@@ -614,13 +1012,23 @@ run_conduit() {
         sh -c "chown -R 1000:1000 /home/conduit/data" 2>/dev/null || true
 
     # Start the Conduit container
+    local net_args=""
+    if [ "$OS_FAMILY" = "macos" ]; then
+        # Docker Desktop does not support --network host; publish ports explicitly.
+        # Conduit typically listens on 443; we publish both TCP and UDP.
+        net_args="-p 443:443/tcp -p 443:443/udp"
+        log_warn "macOS detected: using port publishing instead of host networking (443/tcp+udp)."
+    else
+        net_args="--network host"
+    fi
+
     docker run -d \
         --name conduit \
         --restart unless-stopped \
         -v conduit-data:/home/conduit/data \
-        --network host \
+        $net_args \
         $CONDUIT_IMAGE \
-        start --max-clients "$MAX_CLIENTS" --bandwidth "$BANDWIDTH" --stats-file
+        start --max-clients "$MAX_CLIENTS" --bandwidth "$BANDWIDTH" --stats-file "$STATS_FILE"
 
     # Wait for container to initialize
     sleep 3
@@ -659,6 +1067,12 @@ EOF
 
 setup_autostart() {
     log_info "Setting up auto-start on boot..."
+
+    if [ "$OS_FAMILY" = "macos" ]; then
+        log_warn "Auto-start is not configured on macOS by this script (launchd support not yet implemented)."
+        log_info "Tip: Configure Docker Desktop to start at login, then run: conduit start"
+        return 0
+    fi
     
     if [ "$HAS_SYSTEMD" = "true" ]; then
         # Systemd-based systems
@@ -769,10 +1183,30 @@ create_management_script() {
 # Reference: https://github.com/ssmirr/conduit/releases/tag/d8522a8
 #
 
-VERSION="1.0.2"
+VERSION="1.0.2-Mac"
 INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
 BACKUP_DIR="$INSTALL_DIR/backups"
-CONDUIT_IMAGE="ghcr.io/ssmirr/conduit/conduit:d8522a8"
+GEOIP_DIR="$INSTALL_DIR/geoip"
+GEOIP_MMDB="$GEOIP_DIR/dbip-country-lite.mmdb"
+STATS_FILE="/home/conduit/data/conduit_stats.json"
+CONDUIT_IMAGE="ghcr.io/ssmirr/conduit/conduit:latest"
+
+# On macOS, prefer Homebrew bash (supports associative arrays). Re-exec if needed.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    if command -v /opt/homebrew/bin/bash >/dev/null 2>&1; then
+        if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+            exec /opt/homebrew/bin/bash "$0" "$@"
+        fi
+    elif command -v /usr/local/bin/bash >/dev/null 2>&1; then
+        if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+            exec /usr/local/bin/bash "$0" "$@"
+        fi
+    fi
+    # If still on old bash (<4), warn; associative arrays may fail
+    if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+        echo "Warning: macOS system bash is too old (<4). Install Homebrew bash: brew install bash"
+    fi
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -782,15 +1216,42 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Ensure we have bash 4+ (macOS system bash is 3.x)
+ensure_bash_v4() {
+    if [ -n "${BASH_VERSINFO[0]:-}" ] && [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+        return 0
+    fi
+
+    local brew_prefix=""
+    command -v brew &>/dev/null && brew_prefix="$(brew --prefix 2>/dev/null || true)"
+    local brew_bash="${brew_prefix:+$brew_prefix/bin/bash}"
+    [ -z "$brew_bash" ] && brew_bash="/opt/homebrew/bin/bash"
+
+    if [ -x "$brew_bash" ]; then
+        echo "Re-executing with newer bash: $brew_bash"
+        exec "$brew_bash" "$0" "$@"
+    fi
+
+    echo -e "${RED}Error: This script requires bash 4 or newer.${NC}"
+    echo "macOS system bash is too old (3.x). Install a newer bash:"
+    echo "  brew install bash"
+    echo "Then rerun: $0"
+    exit 1
+}
+
+ensure_bash_v4 "$@"
+
 # Load settings
 [ -f "$INSTALL_DIR/settings.conf" ] && source "$INSTALL_DIR/settings.conf"
 MAX_CLIENTS=${MAX_CLIENTS:-200}
 BANDWIDTH=${BANDWIDTH:-5}
 
-# Ensure we're running as root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Error: This command must be run as root (use sudo conduit)${NC}"
-    exit 1
+# On macOS, Docker works without root. Some features (like tcpdump) may still require sudo.
+if [ "$(uname -s 2>/dev/null)" != "Darwin" ]; then
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Error: This command must be run as root (use sudo conduit)${NC}"
+        exit 1
+    fi
 fi
 
 # Check if Docker is available
@@ -825,6 +1286,294 @@ if ! command -v awk &>/dev/null; then
     echo -e "${YELLOW}Warning: awk not found. Some stats may not display correctly.${NC}"
 fi
 
+# GeoIP helpers (macOS uses mmdblookup + DB-IP Lite database)
+resolve_geoip_db() {
+    local path="$GEOIP_MMDB"
+    if [ -f "$path" ]; then
+        echo "$path"
+        return
+    fi
+
+    # If running under sudo on macOS, also check the invoking user's install dir
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ -n "${SUDO_USER:-}" ]; then
+        local user_home=""
+        user_home=$(eval echo "~${SUDO_USER}" 2>/dev/null || true)
+        if [ -n "$user_home" ]; then
+            local alt1="$user_home/.conduit/geoip/dbip-country-lite.mmdb"
+            local alt2="$user_home/.conduit-user/geoip/dbip-country-lite.mmdb"
+            [ -f "$alt1" ] && { echo "$alt1"; return; }
+            [ -f "$alt2" ] && { echo "$alt2"; return; }
+        fi
+    fi
+
+    echo ""
+}
+
+find_mmdblookup() {
+    # Try PATH first
+    if command -v mmdblookup >/dev/null 2>&1; then
+        command -v mmdblookup
+        return
+    fi
+    # Common Homebrew locations (sudo may not inherit PATH)
+    if [ -x "/opt/homebrew/bin/mmdblookup" ]; then
+        echo "/opt/homebrew/bin/mmdblookup"
+        return
+    fi
+    if [ -x "/usr/local/bin/mmdblookup" ]; then
+        echo "/usr/local/bin/mmdblookup"
+        return
+    fi
+    echo ""
+}
+
+geoip_lookup_country() {
+    local ip="$1"
+    if [ -z "$ip" ]; then
+        echo "Unknown"
+        return
+    fi
+
+    if command -v geoiplookup &>/dev/null; then
+        # Linux: geoiplookup output example: "GeoIP Country Edition: US, United States"
+        geoiplookup "$ip" 2>/dev/null | awk -F: '/Country Edition/{print $2}' | sed 's/^ //'
+        return
+    fi
+
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        local mmdb_bin
+        mmdb_bin="$(find_mmdblookup)"
+        if [ -z "$mmdb_bin" ]; then
+            echo "Unknown"
+            return
+        fi
+        local mmdb_path
+        mmdb_path="$(resolve_geoip_db)"
+        if [ -z "$mmdb_path" ] || [ ! -f "$mmdb_path" ]; then
+            echo "Unknown"
+            return
+        fi
+        # Extract country (prefer English name; fallback to ISO code).
+        # mmdblookup output format varies; use grep-based parsing for robustness.
+        local name_line name
+        name_line=$("$mmdb_bin" --file "$mmdb_path" --ip "$ip" country names en 2>/dev/null | tr -d '\r')
+        name=$(echo "$name_line" | grep -Eo '"[^"]+"' | tail -1 | tr -d '"')
+        if [ -n "$name" ]; then
+            echo "$name"
+            return
+        fi
+
+        local iso_line iso
+        iso_line=$("$mmdb_bin" --file "$mmdb_path" --ip "$ip" country iso_code 2>/dev/null | tr -d '\r')
+        iso=$(echo "$iso_line" | grep -Eo '"[A-Z]{2}"' | head -1 | tr -d '"')
+        if [ -n "$iso" ]; then
+            echo "$iso"
+            return
+        fi
+        echo "Unknown"
+        return
+    fi
+
+    echo "Unknown"
+}
+
+geoip_diag() {
+    # Lightweight diagnostic to help troubleshoot "Unknown" countries on macOS.
+    local mmdb_bin mmdb_path sample result
+    mmdb_bin="$(find_mmdblookup)"
+    mmdb_path="$(resolve_geoip_db)"
+
+    echo "GeoIP diagnostic (DB-IP Lite):"
+    echo "  mmdblookup: ${mmdb_bin:-not found}"
+    echo "  mmdb path : ${mmdb_path:-not found}"
+
+    sample="8.8.8.8"
+    if [ -n "$mmdb_bin" ] && [ -n "$mmdb_path" ] && [ -f "$mmdb_path" ]; then
+        result=$("$mmdb_bin" --file "$mmdb_path" --ip "$sample" country names en 2>/dev/null | awk -F'"' '/"en"/{print $4; exit}')
+        if [ -z "$result" ]; then
+            result=$("$mmdb_bin" --file "$mmdb_path" --ip "$sample" country iso_code 2>/dev/null | awk -F'"' '/\"iso_code\"/{getline; if ($0 ~ /\"[A-Z]{2}\"/) {gsub(/"/,""); print $1; exit}}')
+        fi
+        echo "  sample ${sample}: ${result:-Unknown}"
+    else
+        echo "  sample lookup: unavailable"
+    fi
+    echo ""
+}
+
+update_geoip_db() {
+    if [ "$(uname -s 2>/dev/null)" != "Darwin" ]; then
+        echo -e "${YELLOW}GeoIP DB updater is only needed on macOS.${NC}"
+        return 0
+    fi
+
+    mkdir -p "$GEOIP_DIR"
+
+    if [ -f "$GEOIP_MMDB" ]; then
+        read -p "Replace existing GeoIP database? [y/N] " confirm < /dev/tty || true
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            echo "Cancelled."
+            return 0
+        fi
+    fi
+
+    echo -e "${CYAN}Downloading DB-IP Lite database...${NC}"
+    local tmpdir
+    tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t conduit_geoip)"
+    local download_path="$tmpdir/dbip-country-lite.mmdb.gz"
+    local download_ok=0
+    local year_month=""
+    local url=""
+
+    year_month="$(date +%Y-%m 2>/dev/null || echo "")"
+    if [ -n "$year_month" ]; then
+        url="https://download.db-ip.com/free/dbip-country-lite-${year_month}.mmdb.gz"
+        if curl -fL -sS "$url" -o "$download_path"; then
+            download_ok=1
+        fi
+    fi
+
+    if [ "$download_ok" -ne 1 ]; then
+        local prev_year_month=""
+        if date -v -1m +%Y-%m >/dev/null 2>&1; then
+            prev_year_month="$(date -v -1m +%Y-%m 2>/dev/null || echo "")"
+        elif date -d "1 month ago" +%Y-%m >/dev/null 2>&1; then
+            prev_year_month="$(date -d "1 month ago" +%Y-%m 2>/dev/null || echo "")"
+        fi
+        if [ -n "$prev_year_month" ]; then
+            url="https://download.db-ip.com/free/dbip-country-lite-${prev_year_month}.mmdb.gz"
+            if curl -fL -sS "$url" -o "$download_path"; then
+                download_ok=1
+            fi
+        fi
+    fi
+
+    if [ "$download_ok" -ne 1 ]; then
+        echo -e "${RED}Failed to download DB-IP Lite database.${NC}"
+        rm -rf "$tmpdir" 2>/dev/null || true
+        return 1
+    fi
+
+    local extracted_mmdb="$tmpdir/dbip-country-lite.mmdb"
+    local file_type=""
+    if command -v file &>/dev/null; then
+        file_type="$(file -b "$download_path" 2>/dev/null || true)"
+    fi
+
+    if [ -z "$file_type" ] && command -v od &>/dev/null; then
+        local magic
+        magic="$(od -An -t x1 -N 4 "$download_path" 2>/dev/null | tr -d ' \n')"
+        case "$magic" in
+            504b0304) file_type="zip" ;;
+            1f8b08*) file_type="gzip" ;;
+            3c21444f|3c68746d) file_type="html" ;;
+        esac
+    fi
+
+    case "$file_type" in
+        *HTML*|*html*)
+            echo -e "${RED}Download did not return a database file (HTML response).${NC}"
+            rm -rf "$tmpdir" 2>/dev/null || true
+            return 1
+            ;;
+        *gzip*|*GZIP*|*gz*)
+            if ! command -v gzip &>/dev/null; then
+                echo -e "${RED}Gzip archive detected but gzip is not available.${NC}"
+                rm -rf "$tmpdir" 2>/dev/null || true
+                return 1
+            fi
+            if ! gzip -dc "$download_path" > "$extracted_mmdb" 2>/dev/null; then
+                echo -e "${RED}Failed to extract DB-IP Lite gzip archive.${NC}"
+                rm -rf "$tmpdir" 2>/dev/null || true
+                return 1
+            fi
+            ;;
+        *Zip*|*zip*)
+            if command -v unzip &>/dev/null; then
+                if ! unzip -p "$download_path" "*.mmdb" > "$extracted_mmdb" 2>/dev/null; then
+                    echo -e "${RED}Failed to extract DB-IP Lite zip archive.${NC}"
+                    rm -rf "$tmpdir" 2>/dev/null || true
+                    return 1
+                fi
+            elif command -v python3 &>/dev/null; then
+                if ! python3 - "$download_path" "$extracted_mmdb" <<'PY'
+import sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as z:
+    for name in z.namelist():
+        if name.lower().endswith(".mmdb"):
+            with z.open(name) as f, open(dst, "wb") as out:
+                out.write(f.read())
+            sys.exit(0)
+sys.exit(1)
+PY
+                then
+                    echo -e "${RED}Failed to extract DB-IP Lite zip archive.${NC}"
+                    rm -rf "$tmpdir" 2>/dev/null || true
+                    return 1
+                fi
+            else
+                echo -e "${RED}Zip archive detected but unzip/python3 not available.${NC}"
+                rm -rf "$tmpdir" 2>/dev/null || true
+                return 1
+            fi
+            ;;
+        *)
+            # Assume direct MMDB download
+            cp "$download_path" "$extracted_mmdb" 2>/dev/null || true
+            ;;
+    esac
+
+    if [ ! -f "$extracted_mmdb" ]; then
+        echo -e "${RED}DB-IP Lite MMDB not found in downloaded archive.${NC}"
+        rm -rf "$tmpdir" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! cp "$extracted_mmdb" "$GEOIP_MMDB"; then
+        echo -e "${RED}Failed to install GeoIP database to: $GEOIP_MMDB${NC}"
+        rm -rf "$tmpdir" 2>/dev/null || true
+        return 1
+    fi
+
+    rm -rf "$tmpdir" 2>/dev/null || true
+    echo -e "${GREEN}✓ GeoIP database updated: $GEOIP_MMDB${NC}"
+}
+
+run_with_timeout() {
+    # Usage: run_with_timeout <seconds> <command...>
+    local seconds="$1"
+    shift
+    if command -v timeout &>/dev/null; then
+        timeout "$seconds" "$@"
+    elif command -v gtimeout &>/dev/null; then
+        gtimeout "$seconds" "$@"
+    elif command -v perl &>/dev/null; then
+        # Portable fallback using perl alarm
+        perl -e 'alarm shift; exec @ARGV' "$seconds" "$@"
+    elif command -v python3 &>/dev/null; then
+        # Python fallback if perl is unavailable (macOS may not ship perl)
+        python3 -c 'import signal, subprocess, sys
+def handler(signum, frame):
+    raise TimeoutError()
+signal.signal(signal.SIGALRM, handler)
+sec = int(sys.argv[1])
+cmd = sys.argv[2:]
+if not cmd:
+    sys.exit(0)
+signal.alarm(sec)
+try:
+    result = subprocess.run(cmd)
+    signal.alarm(0)
+    sys.exit(result.returncode)
+except TimeoutError:
+    sys.exit(124)
+' "$seconds" "$@"
+    else
+        echo "Error: timeout requires 'timeout', 'gtimeout', 'perl', or 'python3'." >&2
+        return 124
+    fi
+}
+
 # Helper: Fix volume permissions for conduit user (uid 1000)
 fix_volume_permissions() {
     docker run --rm -v conduit-data:/home/conduit/data alpine \
@@ -833,19 +1582,36 @@ fix_volume_permissions() {
 
 # Helper: Start/recreate conduit container with current settings
 run_conduit_container() {
+    local net_args="--network host"
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        # Docker Desktop does not support host networking; publish ports explicitly.
+        net_args="-p 443:443/tcp -p 443:443/udp"
+    fi
     docker run -d \
         --name conduit \
         --restart unless-stopped \
         -v conduit-data:/home/conduit/data \
-        --network host \
+        $net_args \
         $CONDUIT_IMAGE \
-        start --max-clients "$MAX_CLIENTS" --bandwidth "$BANDWIDTH" --stats-file
+        start --max-clients "$MAX_CLIENTS" --bandwidth "$BANDWIDTH" --stats-file "$STATS_FILE"
 }
 
 print_header() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════╗"
-    printf "║                🚀 PSIPHON CONDUIT MANAGER v%-5s                  ║\n" "${VERSION}"
+    local inner_width=67
+    local title="🚀  PSIPHON CONDUIT MANAGER v${VERSION}"
+    local title_len=${#title}
+    local emoji_width=0
+    if [[ "$title" == *"🚀"* ]]; then
+        emoji_width=1
+    fi
+    local visible_len=$((title_len + emoji_width))
+    local pad_total=$((inner_width - visible_len))
+    [ "$pad_total" -lt 0 ] && pad_total=0
+    local pad_left=$((pad_total / 2))
+    local pad_right=$((pad_total - pad_left))
+    printf "║%*s%s%*s║\n" "$pad_left" "" "$title" "$pad_right" ""
     echo "╚═══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -853,7 +1619,29 @@ print_header() {
 print_live_stats_header() {
     local EL="\033[K"
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════╗${EL}"
-    echo -e "║                    CONDUIT LIVE STATISTICS                        ║${EL}"
+    local left=" 🚀 PSIPHON CONDUIT MANAGER v${VERSION} "
+    local right="CONDUIT LIVE STATISTICS"
+    local inner_width=67
+    local left_trim="$left"
+    local left_len=${#left_trim}
+    local emoji_width=0
+    if [[ "$left_trim" == *"🚀"* ]]; then
+        emoji_width=1
+    fi
+    local right_len=${#right}
+    local rem=$((inner_width - 2 - (left_len + emoji_width) - 1 - right_len))
+    while [ "$rem" -lt 0 ] && [ "$left_len" -gt 0 ]; do
+        left_len=$((left_len - 1))
+        left_trim="${left_trim:0:$left_len}"
+        if [[ "$left_trim" == *"🚀"* ]]; then
+            emoji_width=1
+        else
+            emoji_width=0
+        fi
+        rem=$((inner_width - 2 - (left_len + emoji_width) - 1 - right_len))
+    done
+    [ "$rem" -lt 0 ] && rem=0
+    printf "║  %s %s%*s║${EL}\n" "$left_trim" "$right" "$rem" ""
     echo -e "╠═══════════════════════════════════════════════════════════════════╣${EL}"
     printf "║  Max Clients: ${GREEN}%-52s${CYAN}║${EL}\n" "${MAX_CLIENTS}"
     if [ "$BANDWIDTH" == "-1" ]; then
@@ -861,7 +1649,6 @@ print_live_stats_header() {
     else
         printf "║  Bandwidth:   ${GREEN}%-52s${CYAN}║${EL}\n" "${BANDWIDTH} Mbps"
     fi
-    echo -e "║                                                                   ║${EL}"
     echo -e "╚═══════════════════════════════════════════════════════════════════╝${EL}"
     echo -e "${NC}\033[K"
 }
@@ -944,7 +1731,9 @@ get_container_stats() {
 
 get_cpu_cores() {
     local cores=1
-    if command -v nproc &>/dev/null; then
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    elif command -v nproc &>/dev/null; then
         cores=$(nproc)
     elif [ -f /proc/cpuinfo ]; then
         cores=$(grep -c ^processor /proc/cpuinfo)
@@ -960,7 +1749,18 @@ get_system_stats() {
     local sys_cpu="0%"
     local cpu_tmp="/tmp/conduit_cpu_state"
     
-    if [ -f /proc/stat ]; then
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        local cpu_line cpu_user cpu_sys cpu_usage
+        cpu_line=$(top -l 1 -n 0 2>/dev/null | awk -F'CPU usage:' 'NF>1{print $2; exit}')
+        cpu_user=$(echo "$cpu_line" | sed -n 's/.*\([0-9.]*\)% user.*/\1/p')
+        cpu_sys=$(echo "$cpu_line" | sed -n 's/.*\([0-9.]*\)% sys.*/\1/p')
+        if [[ "$cpu_user" =~ ^[0-9.]+$ ]] && [[ "$cpu_sys" =~ ^[0-9.]+$ ]]; then
+            cpu_usage=$(awk -v u="$cpu_user" -v s="$cpu_sys" 'BEGIN { printf "%.1f", u + s }')
+            sys_cpu="${cpu_usage}%"
+        else
+            sys_cpu="N/A"
+        fi
+    elif [ -f /proc/stat ]; then
         read -r cpu user nice system idle iowait irq softirq steal guest < /proc/stat
         local total_curr=$((user + nice + system + idle + iowait + irq + softirq + steal))
         local work_curr=$((user + nice + system + irq + softirq + steal))
@@ -989,7 +1789,26 @@ get_system_stats() {
     local sys_ram_total="N/A"
     local sys_ram_pct="N/A"
     
-    if command -v free &>/dev/null; then
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        local total_bytes
+        total_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo "")
+        local page_size
+        page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo "")
+        local free_pages=""
+        if [ -n "$total_bytes" ] && [ -n "$page_size" ]; then
+            free_pages=$(vm_stat 2>/dev/null | awk '/Pages free/ {gsub(/\./,"",$(NF)); print $(NF)}')
+        fi
+        if [ -n "$total_bytes" ] && [ -n "$page_size" ] && [ -n "$free_pages" ]; then
+            local free_bytes=$((free_pages * page_size))
+            local used_bytes=$((total_bytes - free_bytes))
+            if [ "$used_bytes" -lt 0 ] 2>/dev/null; then
+                used_bytes=0
+            fi
+            sys_ram_used=$(format_bytes_compact "$used_bytes")
+            sys_ram_total=$(format_bytes_compact "$total_bytes")
+            sys_ram_pct=$(awk -v u="$used_bytes" -v t="$total_bytes" 'BEGIN { if (t>0) printf "%.1f%%", (u*100)/t; else print "N/A" }')
+        fi
+    elif command -v free &>/dev/null; then
         # Output: used total percentage
         local ram_data=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%s %s %.2f%%", $3, $2, ($3/$2)*100}')
         local ram_human=$(free -h 2>/dev/null | awk '/^Mem:/{print $3 " " $2}')
@@ -1056,29 +1875,90 @@ format_bytes() {
     fi
 }
 
+format_bytes_compact() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" -eq 0 ] 2>/dev/null; then
+        echo "0B"
+        return
+    fi
+    if [ "$bytes" -ge 1073741824 ]; then
+        awk "BEGIN {printf \"%.2fGiB\", $bytes/1073741824}"
+    elif [ "$bytes" -ge 1048576 ]; then
+        awk "BEGIN {printf \"%.2fMiB\", $bytes/1048576}"
+    elif [ "$bytes" -ge 1024 ]; then
+        awk "BEGIN {printf \"%.2fKiB\", $bytes/1024}"
+    else
+        echo "${bytes}B"
+    fi
+}
+
 # show_peers() - Live peer traffic by country using tcpdump + GeoIP
 show_peers() {
     # Flag to control the main loop - set to 1 on user interrupt
     local stop_peers=0
     trap 'stop_peers=1' SIGINT SIGTERM
 
+    local is_darwin=0
+    [ "$(uname -s 2>/dev/null)" = "Darwin" ] && is_darwin=1
+
     # Verify required dependencies are installed
-    if ! command -v tcpdump &>/dev/null || ! command -v geoiplookup &>/dev/null; then
-        echo -e "${RED}Error: tcpdump or geoiplookup not found!${NC}"
-        echo "Please re-run the main installer to fix dependencies."
+    # macOS requires sudo for tcpdump; enforce it for this feature.
+    if [ $is_darwin -eq 1 ] && [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Error: Viewing peers by country requires elevated privileges on macOS (tcpdump).${NC}"
+        echo "Run:"
+        echo "  sudo conduit peers"
         read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
         return 1
     fi
 
+    if ! command -v tcpdump &>/dev/null; then
+        echo -e "${RED}Error: tcpdump not found!${NC}"
+        read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
+        return 1
+    fi
+
+    # GeoIP backend: require either geoiplookup (Linux) or mmdblookup+DB (macOS)
+    if ! command -v geoiplookup &>/dev/null; then
+        if [ $is_darwin -eq 1 ]; then
+            local mmdb_bin mmdb_path
+            mmdb_bin="$(find_mmdblookup)"
+            mmdb_path="$(resolve_geoip_db)"
+            if [ -z "$mmdb_bin" ] || [ -z "$mmdb_path" ] || [ ! -f "$mmdb_path" ]; then
+                echo -e "${RED}Error: GeoIP database not configured.${NC}"
+                echo "Re-run the installer to set up DB-IP Lite database, then try again."
+                echo ""
+                geoip_diag
+                read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
+                return 1
+            fi
+        else
+            echo -e "${RED}Error: geoiplookup not found!${NC}"
+            echo "Please re-run the main installer to fix dependencies."
+            read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
+            return 1
+        fi
+    fi
+
     # Network interface detection
-    # Use "any" to capture on all interfaces
     local iface="any"
 
     # Detect local IP address to determine traffic direction
-    # Method 1: Query the route to a public IP (most reliable)
-    # Method 2: Fallback to hostname -I
-    local local_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}')
-    [ -z "$local_ip" ] && local_ip=$(hostname -I | awk '{print $1}')
+    local local_ip=""
+    if [ $is_darwin -eq 1 ]; then
+        iface="$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2; exit}')"
+        [ -z "$iface" ] && iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+        [ -z "$iface" ] && iface="en0"
+        local_ip="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+    else
+        # Linux
+        local_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}')
+        [ -z "$local_ip" ] && local_ip=$(hostname -I | awk '{print $1}')
+    fi
+
+    # On macOS, print GeoIP diagnostic once up-front
+    if [ $is_darwin -eq 1 ]; then
+        geoip_diag
+    fi
 
     # Clean temporary working files (per-cycle data only)
     rm -f /tmp/conduit_peers_current /tmp/conduit_peers_raw
@@ -1086,7 +1966,7 @@ show_peers() {
     touch /tmp/conduit_traffic_from /tmp/conduit_traffic_to
 
     # Persistent data directory - survives across option 9 sessions
-    local persist_dir="/opt/conduit/traffic_stats"
+    local persist_dir="$INSTALL_DIR/traffic_stats"
     mkdir -p "$persist_dir"
 
     # Get container start time to detect restarts
@@ -1136,16 +2016,36 @@ show_peers() {
         local dur_sec=$((duration % 60))
         local duration_str=$(printf "%02d:%02d" $dur_min $dur_sec)
 
+        local inner_width=67
+        local title="LIVE PEER TRAFFIC BY COUNTRY"
+        local title_len=${#title}
+        local pad_total=$((inner_width - title_len))
+        [ "$pad_total" -lt 0 ] && pad_total=0
+        local pad_left=$((pad_total / 2))
+        local pad_right=$((pad_total - pad_left))
+
         echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "║                    LIVE PEER TRAFFIC BY COUNTRY                   ║"
+        printf "${CYAN}║%*s%s%*s║${NC}\n" "$pad_left" "" "$title" "$pad_right" ""
         echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════════╣${NC}"
         if [ -f /tmp/conduit_peers_current ]; then
             # Data is available - show last update time
             local update_time=$(date '+%H:%M:%S')
-            echo -e "║  Last Update: ${update_time}                                    ${GREEN}[LIVE]${NC}  ║"
+            local left_raw="Last Update: ${update_time}"
+            local right_raw="[LIVE]"
+            local left_pad
+            local right_pad
+            left_pad=$(printf "%-56s" "$left_raw")
+            right_pad=$(printf "%7s" "$right_raw")
+            printf "%b║  %b%s%b %b%s%b %b║%b\n" "$CYAN" "" "$left_pad" "$NC" "$GREEN" "$right_pad" "$NC" "$CYAN" "$NC"
         else
             # Waiting for first data capture
-            echo -e "║  Status: ${YELLOW}Initializing...${NC}                                         ║"
+            local left_raw="Status: Initializing..."
+            local right_raw=""
+            local left_pad
+            local right_pad
+            left_pad=$(printf "%-56s" "$left_raw")
+            right_pad=$(printf "%7s" "$right_raw")
+            printf "%b║  %b%s%b %b%s%b %b║%b\n" "$CYAN" "$YELLOW" "$left_pad" "$NC" "" "$right_pad" "$NC" "$CYAN" "$NC"
         fi
         echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════╝${NC}"
         echo -e ""
@@ -1250,7 +2150,7 @@ show_peers() {
         # Wrap pipeline in subshell so $! captures the whole pipeline PID, not just awk
         # This ensures the progress indicator runs for the full 15-second capture
         (
-            timeout 15 tcpdump -ni $iface -q '(tcp or udp)' 2>/dev/null | \
+            run_with_timeout 15 tcpdump -ni $iface -q '(tcp or udp)' 2>/dev/null | \
             awk -v local_ip="$local_ip" '
             # Portable awk script - works with mawk, gawk, and busybox awk
             /IP/ {
@@ -1410,7 +2310,7 @@ show_peers() {
                 [ -z "$ip" ] && continue
 
                 # Resolve IP to country using GeoIP database
-                local country_info=$(geoiplookup "$ip" 2>/dev/null | awk -F: '/Country Edition/{print $2}' | sed 's/^ //')
+                local country_info=$(geoip_lookup_country "$ip")
                 [ -z "$country_info" ] && country_info="Unknown"
 
                 # Normalize certain country names for display
@@ -1529,28 +2429,55 @@ show_peers() {
 get_net_speed() {
     # Calculate System Network Speed (Active 0.5s Sample)
     # Returns: "RX_MBPS TX_MBPS"
-    local iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5}')
-    [ -z "$iface" ] && iface=$(ip route list default 2>/dev/null | awk '{print $5}')
-    
+    local iface=""
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+    else
+        iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5}')
+        [ -z "$iface" ] && iface=$(ip route list default 2>/dev/null | awk '{print $5}')
+    fi
+
+    if [ -z "$iface" ]; then
+        echo "0.00 0.00"
+        return
+    fi
+
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v netstat &>/dev/null; then
+        local rx1 tx1 rx2 tx2
+        rx1=$(netstat -ib -I "$iface" 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++){if($i=="Ibytes")ib=i;if($i=="Obytes")ob=i}} NR>1 {rx+=$ib} END{print rx}')
+        tx1=$(netstat -ib -I "$iface" 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++){if($i=="Ibytes")ib=i;if($i=="Obytes")ob=i}} NR>1 {tx+=$ob} END{print tx}')
+        sleep 0.5
+        rx2=$(netstat -ib -I "$iface" 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++){if($i=="Ibytes")ib=i;if($i=="Obytes")ob=i}} NR>1 {rx+=$ib} END{print rx}')
+        tx2=$(netstat -ib -I "$iface" 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++){if($i=="Ibytes")ib=i;if($i=="Obytes")ob=i}} NR>1 {tx+=$ob} END{print tx}')
+
+        if [ -n "$rx1" ] && [ -n "$rx2" ] && [ -n "$tx1" ] && [ -n "$tx2" ]; then
+            local rx_delta=$((rx2 - rx1))
+            local tx_delta=$((tx2 - tx1))
+            local rx_mbps=$(awk -v b="$rx_delta" 'BEGIN { printf "%.2f", (b * 16) / 1000000 }')
+            local tx_mbps=$(awk -v b="$tx_delta" 'BEGIN { printf "%.2f", (b * 16) / 1000000 }')
+            echo "$rx_mbps $tx_mbps"
+            return
+        fi
+    fi
+
     if [ -n "$iface" ] && [ -f "/sys/class/net/$iface/statistics/rx_bytes" ]; then
         local rx1=$(cat /sys/class/net/$iface/statistics/rx_bytes)
         local tx1=$(cat /sys/class/net/$iface/statistics/tx_bytes)
-        
+
         sleep 0.5
-        
+
         local rx2=$(cat /sys/class/net/$iface/statistics/rx_bytes)
         local tx2=$(cat /sys/class/net/$iface/statistics/tx_bytes)
-        
+
         # Calculate Delta (Bytes)
         local rx_delta=$((rx2 - rx1))
         local tx_delta=$((tx2 - tx1))
-        
+
         # Convert to Mbps: (bytes * 8 bits) / (0.5 sec * 1,000,000)
         # Formula simplified: bytes * 16 / 1000000
-        
         local rx_mbps=$(awk -v b="$rx_delta" 'BEGIN { printf "%.2f", (b * 16) / 1000000 }')
         local tx_mbps=$(awk -v b="$tx_delta" 'BEGIN { printf "%.2f", (b * 16) / 1000000 }')
-        
+
         echo "$rx_mbps $tx_mbps"
     else
         echo "0.00 0.00"
@@ -1621,14 +2548,15 @@ show_status() {
             connecting=${connecting:-0}
             connected=${connected:-0}
             
-            echo -e "🚀 PSIPHON CONDUIT MANAGER v${VERSION}${EL}"
-            echo -e "${NC}${EL}"
-            
+            local total_containers=1
+            local running_containers=1
+
             if [ -n "$uptime" ]; then
-                 echo -e "${BOLD}Status:${NC} ${GREEN}Running${NC} (${uptime})  |  ${BOLD}Clients:${NC} ${GREEN}${connected}${NC} connected, ${YELLOW}${connecting}${NC} connecting${EL}"
+                 echo -e "${BOLD}Status:${NC} ${GREEN}Running${NC} (${uptime})${EL}"
             else
-                 echo -e "${BOLD}Status:${NC} ${GREEN}Running${NC}  |  ${BOLD}Clients:${NC} ${GREEN}${connected}${NC} connected, ${YELLOW}${connecting}${NC} connecting${EL}"
+                 echo -e "${BOLD}Status:${NC} ${GREEN}Running${NC}${EL}"
             fi
+            echo -e "  Containers: ${GREEN}${running_containers}${NC}/${total_containers}    Clients: ${GREEN}${connected}${NC} connected, ${YELLOW}${connecting}${NC} connecting${EL}"
             
             echo -e "${EL}"
             echo -e "${CYAN}═══ Traffic ═══${NC}${EL}"
@@ -1642,9 +2570,10 @@ show_status() {
             printf "  %-8s Net: ${YELLOW}%-43s${NC}${EL}\n" "Total:" "$net_display"
             
         else
-             echo -e "🚀 PSIPHON CONDUIT MANAGER v${VERSION}${EL}"
-             echo -e "${NC}${EL}"
+             local total_containers=1
+             local running_containers=1
              echo -e "${BOLD}Status:${NC} ${GREEN}Running${NC}${EL}"
+             echo -e "  Containers: ${GREEN}${running_containers}${NC}/${total_containers}    Clients: ${GREEN}0${NC} connected, ${YELLOW}0${NC} connecting${EL}"
              echo -e "${EL}"
              echo -e "${CYAN}═══ Resource Usage ═══${NC}${EL}"
              printf "  %-8s CPU: ${YELLOW}%-20s${NC} | RAM: ${YELLOW}%-20s${NC}${EL}\n" "App:" "$app_cpu_display" "$app_ram"
@@ -1655,9 +2584,10 @@ show_status() {
         fi
         
     else
-        echo -e "🚀 PSIPHON CONDUIT MANAGER v${VERSION}${EL}"
-        echo -e "${NC}${EL}"
+        local total_containers=1
+        local running_containers=0
         echo -e "${BOLD}Status:${NC} ${RED}Stopped${NC}${EL}"
+        echo -e "  Containers: ${YELLOW}${running_containers}${NC}/${total_containers}${EL}"
     fi
     
 
@@ -1670,6 +2600,7 @@ show_status() {
     else
         echo -e "  Bandwidth:    ${BANDWIDTH} Mbps${EL}"
     fi
+    echo -e "  Containers:   1${EL}"
 
     
     echo ""
@@ -1989,6 +2920,7 @@ show_menu() {
             echo -e "  8. 🔁 Restart Conduit"
             echo ""
             echo -e "  9. 🌍 View live peers by country (Live Map)"
+            echo -e "  g. 🌐 Update GeoIP database (DB-IP Lite)"
             echo ""
             echo -e "  h. 🩺 Health check"
             echo -e "  b. 💾 Backup node key"
@@ -2045,6 +2977,11 @@ show_menu() {
                 show_peers
                 redraw=true
                 ;;
+            g|G)
+                update_geoip_db
+                read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
+                redraw=true
+                ;;
             h|H)
                 health_check
                 read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
@@ -2097,6 +3034,7 @@ show_help() {
     echo "  stop      Stop Conduit container"
     echo "  restart   Restart Conduit container"
     echo "  update    Update to latest Conduit image"
+    echo "  geoip-update  Update DB-IP Lite GeoIP database (macOS)"
     echo "  settings  Change max-clients/bandwidth"
     echo "  backup    Backup Conduit node identity key"
     echo "  restore   Restore Conduit node identity from backup"
@@ -2182,13 +3120,27 @@ health_check() {
         fi
     fi
 
-    # 5b. Check if STATS output is enabled (requires -v flag)
+    # 5b. Check if stats output is enabled (stats file or log output)
     echo -n "Stats output:         "
-    local stats_count=$(docker logs --tail 100 conduit 2>&1 | grep -c "\[STATS\]" || true)
-    if [ "$stats_count" -gt 0 ]; then
-        echo -e "${GREEN}OK${NC} (${stats_count} entries)"
+    local stats_ok=false
+    local stats_path=""
+    local mountpoint=$(docker volume inspect conduit-data --format '{{ .Mountpoint }}' 2>/dev/null)
+    if [ -n "$mountpoint" ]; then
+        stats_path="$mountpoint/conduit_stats.json"
+        if [ -s "$stats_path" ]; then
+            stats_ok=true
+        fi
+    fi
+    if [ "$stats_ok" = false ]; then
+        local stats_count=$(docker logs --tail 200 conduit 2>&1 | grep -c "\[STATS\]" || true)
+        if [ "$stats_count" -gt 0 ]; then
+            stats_ok=true
+        fi
+    fi
+    if [ "$stats_ok" = true ]; then
+        echo -e "${GREEN}OK${NC}"
     else
-        echo -e "${YELLOW}NONE${NC} - Run 'conduit restart' to enable"
+        echo -e "${YELLOW}NONE${NC} - Run 'conduit restart' and wait 30-60s"
     fi
 
     # 6. Check data volume
@@ -2202,7 +3154,6 @@ health_check() {
 
     # 7. Check node key exists
     echo -n "Node identity key:    "
-    local mountpoint=$(docker volume inspect conduit-data --format '{{ .Mountpoint }}' 2>/dev/null)
     if [ -n "$mountpoint" ] && [ -f "$mountpoint/conduit_key.json" ]; then
         echo -e "${GREEN}OK${NC}"
     else
@@ -2417,6 +3368,7 @@ case "${1:-menu}" in
     stop)     stop_conduit ;;
     restart)  restart_conduit ;;
     update)   update_conduit ;;
+    geoip-update|geoip) update_geoip_db ;;
     peers)    show_peers ;;
     settings) change_settings ;;
     backup)   backup_key ;;
@@ -2429,14 +3381,41 @@ esac
 MANAGEMENT
 
     # Patch the INSTALL_DIR in the generated script
-    sed -i "s#REPLACE_ME_INSTALL_DIR#$INSTALL_DIR#g" "$INSTALL_DIR/conduit"
+    # Use portable in-place sed (GNU sed vs BSD/macOS sed)
+    if sed --version >/dev/null 2>&1; then
+        # GNU sed (Linux)
+        sed -i "s#REPLACE_ME_INSTALL_DIR#$INSTALL_DIR#g" "$INSTALL_DIR/conduit"
+    else
+        # BSD sed (macOS)
+        sed -i '' "s#REPLACE_ME_INSTALL_DIR#$INSTALL_DIR#g" "$INSTALL_DIR/conduit"
+    fi
     
     chmod +x "$INSTALL_DIR/conduit"
     # Force create symlink
-    rm -f /usr/local/bin/conduit 2>/dev/null || true
-    ln -s "$INSTALL_DIR/conduit" /usr/local/bin/conduit
-    
-    log_success "Management script installed: conduit"
+    if [ "$OS_FAMILY" = "macos" ]; then
+        # Prefer Homebrew prefix on Apple Silicon; fall back to /usr/local for Intel/brew variants.
+        local brew_prefix=""
+        command -v brew &>/dev/null && brew_prefix="$(brew --prefix 2>/dev/null || true)"
+        local link_dir="${brew_prefix:-/usr/local}/bin"
+        local link_path="$link_dir/conduit"
+
+        if [ -n "$link_dir" ] && [ -d "$link_dir" ] && [ -w "$link_dir" ]; then
+            rm -f "$link_path" 2>/dev/null || true
+            ln -s "$INSTALL_DIR/conduit" "$link_path"
+            log_success "Management script installed: conduit"
+            log_info "Run it with: conduit"
+        else
+            log_warn "Could not install a global 'conduit' command (no write access to ${link_dir})."
+            log_info "You can run it directly:"
+            log_info "  $INSTALL_DIR/conduit"
+            log_info "Or install the symlink yourself:"
+            log_info "  sudo ln -sf \"$INSTALL_DIR/conduit\" \"${link_path}\""
+        fi
+    else
+        rm -f /usr/local/bin/conduit 2>/dev/null || true
+        ln -s "$INSTALL_DIR/conduit" /usr/local/bin/conduit
+        log_success "Management script installed: conduit"
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -2471,12 +3450,12 @@ print_summary() {
     echo -e "${GREEN}╠═══════════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  COMMANDS:                                                        ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}                                                                   ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}conduit${NC}               # Open management menu                    ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}conduit stats${NC}         # View live statistics + CPU/RAM          ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}conduit status${NC}        # Quick status with resource usage        ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}conduit logs${NC}          # View raw logs                           ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}conduit settings${NC}      # Change max-clients/bandwidth            ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}conduit uninstall${NC}     # Remove everything                       ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}conduit${NC}               # Open management menu                     ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}conduit stats${NC}         # View live statistics + CPU/RAM           ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}conduit status${NC}        # Quick status with resource usage         ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}conduit logs${NC}          # View raw logs                            ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}conduit settings${NC}      # Change max-clients/bandwidth             ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}conduit uninstall${NC}     # Remove everything                        ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}                                                                   ${GREEN}║${NC}"
     echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -2595,8 +3574,9 @@ main() {
     esac
     
     print_header
-    check_root
     detect_os
+    check_root
+    ensure_install_dir_writable
     
     # Ensure all tools (including new ones like tcpdump) are present
     check_dependencies
@@ -2655,6 +3635,7 @@ main() {
     # Step 1: Install Docker (if not already installed)
     log_info "Step 1/5: Installing Docker..."
     install_docker
+    ensure_docker_running
 
     echo ""
 
@@ -2686,10 +3667,12 @@ main() {
 
     read -p "Open management menu now? [Y/n] " open_menu < /dev/tty || true
     if [[ ! "$open_menu" =~ ^[Nn] ]]; then
-        "$INSTALL_DIR/conduit" menu
+        exec "$INSTALL_DIR/conduit" menu
     fi
+
+    exit 0
 }
 #
-# REACHED END OF SCRIPT - VERSION 1.0.2
+# REACHED END OF SCRIPT - VERSION 1.1.0
 # ###############################################################################
 main "$@"
