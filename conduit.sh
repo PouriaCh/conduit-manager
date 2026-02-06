@@ -42,6 +42,9 @@ PERSIST_DIR="$INSTALL_DIR/traffic_stats"
 CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
 CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
 PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
+TRACKER_ENABLED=true
+TRACKER_PID_FILE="$INSTALL_DIR/tracker.pid"
+TRACKER_LOG_FILE="$INSTALL_DIR/tracker.log"
 
 # Colors
 RED='\033[0;31m'
@@ -1147,10 +1150,9 @@ save_settings() {
     CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
     CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
     PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
-    PERSIST_DIR="$INSTALL_DIR/traffic_stats"
-    CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
-    CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
-    PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
+    TRACKER_ENABLED=${TRACKER_ENABLED:-true}
+    TRACKER_PID_FILE="$INSTALL_DIR/tracker.pid"
+    TRACKER_LOG_FILE="$INSTALL_DIR/tracker.log"
     PERSIST_DIR="$INSTALL_DIR/traffic_stats"
     CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
     CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
@@ -1164,6 +1166,7 @@ CONTAINER_COUNT=$CONTAINER_COUNT
 CONTAINER_PORT_BASE=$CONTAINER_PORT_BASE
 DOCKER_CPUS=${DOCKER_CPUS:-}
 DOCKER_MEMORY=${DOCKER_MEMORY:-}
+TRACKER_ENABLED=${TRACKER_ENABLED:-true}
 EOF
     for i in $(seq 1 "$CONTAINER_COUNT"); do
         local mc_var="MAX_CLIENTS_${i}"
@@ -1378,6 +1381,8 @@ PERSIST_DIR="$INSTALL_DIR/traffic_stats"
 CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
 CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
 PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
+TRACKER_PID_FILE="$INSTALL_DIR/tracker.pid"
+TRACKER_LOG_FILE="$INSTALL_DIR/tracker.log"
 
 # On macOS, prefer Homebrew bash (supports associative arrays). Re-exec if needed.
 if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
@@ -1929,6 +1934,7 @@ CONTAINER_COUNT=$CONTAINER_COUNT
 CONTAINER_PORT_BASE=$CONTAINER_PORT_BASE
 DOCKER_CPUS=${DOCKER_CPUS:-}
 DOCKER_MEMORY=${DOCKER_MEMORY:-}
+TRACKER_ENABLED=${TRACKER_ENABLED:-true}
 EOF
         for i in $(seq 1 "$CONTAINER_COUNT"); do
             local mc_var="MAX_CLIENTS_${i}"
@@ -1937,6 +1943,223 @@ EOF
             [ -n "${!bw_var}" ] && echo "${bw_var}=${!bw_var}" >> "$tmp"
         done
         mv "$tmp" "$settings_path"
+    fi
+}
+
+is_tracker_active() {
+    if [ -f "$TRACKER_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$TRACKER_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+stop_tracker_service() {
+    if [ -f "$TRACKER_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$TRACKER_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$TRACKER_PID_FILE" 2>/dev/null || true
+    fi
+}
+
+regenerate_tracker_script() {
+    cat > "$INSTALL_DIR/conduit-tracker.sh" << EOF
+#!/bin/bash
+INSTALL_DIR="$INSTALL_DIR"
+CONTAINER_COUNT="${CONTAINER_COUNT:-1}"
+PERSIST_DIR="$PERSIST_DIR"
+CONNECTION_HISTORY_FILE="$CONNECTION_HISTORY_FILE"
+CONNECTION_HISTORY_START_FILE="$CONNECTION_HISTORY_START_FILE"
+PEAK_CONNECTIONS_FILE="$PEAK_CONNECTIONS_FILE"
+_LAST_HISTORY_RECORD=0
+_PEAK_CONNECTIONS=0
+_PEAK_CONTAINER_START=""
+_AVG_CONN_CACHE=""
+_AVG_CONN_CACHE_TIME=0
+
+get_container_name() {
+    local idx=\${1:-1}
+    if [ "\$idx" -eq 1 ]; then
+        echo "conduit"
+    else
+        echo "conduit-\${idx}"
+    fi
+}
+
+get_container_start_time() {
+    local earliest=""
+    for i in \$(seq 1 \${CONTAINER_COUNT:-1}); do
+        local cname=\$(get_container_name \$i 2>/dev/null)
+        [ -z "\$cname" ] && continue
+        local start=\$(docker inspect --format='{{.State.StartedAt}}' "\$cname" 2>/dev/null | cut -d'.' -f1)
+        [ -z "\$start" ] && continue
+        if [ -z "\$earliest" ] || [[ "\$start" < "\$earliest" ]]; then
+            earliest="\$start"
+        fi
+    done
+    echo "\$earliest"
+}
+
+load_peak_connections() {
+    local current_start=\$(get_container_start_time)
+    if [ -f "\$PEAK_CONNECTIONS_FILE" ]; then
+        local saved_start=\$(head -1 "\$PEAK_CONNECTIONS_FILE" 2>/dev/null)
+        local saved_peak=\$(tail -1 "\$PEAK_CONNECTIONS_FILE" 2>/dev/null)
+        if [ "\$saved_start" = "\$current_start" ] && [ -n "\$saved_peak" ]; then
+            _PEAK_CONNECTIONS=\$saved_peak
+            _PEAK_CONTAINER_START="\$current_start"
+            return
+        fi
+    fi
+    _PEAK_CONNECTIONS=0
+    _PEAK_CONTAINER_START="\$current_start"
+    save_peak_connections
+}
+
+save_peak_connections() {
+    mkdir -p "\$(dirname "\$PEAK_CONNECTIONS_FILE")" 2>/dev/null
+    echo "\$_PEAK_CONTAINER_START" > "\$PEAK_CONNECTIONS_FILE"
+    echo "\$_PEAK_CONNECTIONS" >> "\$PEAK_CONNECTIONS_FILE"
+}
+
+check_connection_history_reset() {
+    local current_start=\$(get_container_start_time)
+    if [ -f "\$CONNECTION_HISTORY_START_FILE" ]; then
+        local saved_start=\$(cat "\$CONNECTION_HISTORY_START_FILE" 2>/dev/null)
+        if [ "\$saved_start" = "\$current_start" ] && [ -n "\$saved_start" ]; then
+            return
+        fi
+    fi
+    mkdir -p "\$(dirname "\$CONNECTION_HISTORY_START_FILE")" 2>/dev/null
+    echo "\$current_start" > "\$CONNECTION_HISTORY_START_FILE"
+    rm -f "\$CONNECTION_HISTORY_FILE" 2>/dev/null
+    _AVG_CONN_CACHE=""
+    _AVG_CONN_CACHE_TIME=0
+}
+
+record_connection_history() {
+    local connected=\$1
+    local connecting=\$2
+    local now=\$(date +%s)
+    if [ \$(( now - _LAST_HISTORY_RECORD )) -lt 300 ]; then
+        return
+    fi
+    _LAST_HISTORY_RECORD=\$now
+    check_connection_history_reset
+    mkdir -p "\$(dirname "\$CONNECTION_HISTORY_FILE")" 2>/dev/null
+    echo "\${now}|\${connected}|\${connecting}" >> "\$CONNECTION_HISTORY_FILE"
+    local cutoff=\$((now - 90000))
+    if [ -f "\$CONNECTION_HISTORY_FILE" ]; then
+        awk -F'|' -v cutoff="\$cutoff" '\$1 >= cutoff' "\$CONNECTION_HISTORY_FILE" > "\${CONNECTION_HISTORY_FILE}.tmp" 2>/dev/null
+        mv -f "\${CONNECTION_HISTORY_FILE}.tmp" "\$CONNECTION_HISTORY_FILE" 2>/dev/null
+    fi
+}
+
+get_totals() {
+    local total_connected=0
+    local total_connecting=0
+    for i in \$(seq 1 "\$CONTAINER_COUNT"); do
+        local cname=\$(get_container_name "\$i")
+        local logs=\$(docker logs --tail 200 "\$cname" 2>/dev/null | grep "STATS" | tail -1)
+        [ -z "\$logs" ] && continue
+        local cing=\$(echo "\$logs" | sed -n 's/.*Connecting:[[:space:]]*\\([0-9]*\\).*/\\1/p')
+        local conn=\$(echo "\$logs" | sed -n 's/.*Connected:[[:space:]]*\\([0-9]*\\).*/\\1/p')
+        cing=\${cing:-0}
+        conn=\${conn:-0}
+        total_connecting=\$((total_connecting + cing))
+        total_connected=\$((total_connected + conn))
+    done
+    echo "\${total_connected}|\${total_connecting}"
+}
+
+load_peak_connections
+while true; do
+    totals=\$(get_totals)
+    connected=\$(echo "\$totals" | cut -d'|' -f1)
+    connecting=\$(echo "\$totals" | cut -d'|' -f2)
+    if [ -n "\$connected" ] && [ "\$connected" -gt "\$_PEAK_CONNECTIONS" ] 2>/dev/null; then
+        _PEAK_CONNECTIONS=\$connected
+        save_peak_connections
+    fi
+    record_connection_history "\${connected:-0}" "\${connecting:-0}"
+    sleep 60
+done
+EOF
+    chmod +x "$INSTALL_DIR/conduit-tracker.sh"
+}
+
+setup_tracker_service() {
+    if [ "$TRACKER_ENABLED" != "true" ]; then
+        stop_tracker_service
+        return 0
+    fi
+    if is_tracker_active; then
+        return 0
+    fi
+    regenerate_tracker_script
+    nohup "$INSTALL_DIR/conduit-tracker.sh" >> "$TRACKER_LOG_FILE" 2>&1 &
+    echo $! > "$TRACKER_PID_FILE"
+}
+
+toggle_tracker() {
+    if [ "$TRACKER_ENABLED" = "true" ]; then
+        TRACKER_ENABLED=false
+        stop_tracker_service
+        if command -v save_settings >/dev/null 2>&1; then
+            save_settings
+        else
+            local settings_path="$INSTALL_DIR/settings.conf"
+            local tmp="${settings_path}.tmp.$$"
+            cat > "$tmp" << EOF
+MAX_CLIENTS=$MAX_CLIENTS
+BANDWIDTH=$BANDWIDTH
+CONTAINER_COUNT=$CONTAINER_COUNT
+CONTAINER_PORT_BASE=$CONTAINER_PORT_BASE
+DOCKER_CPUS=${DOCKER_CPUS:-}
+DOCKER_MEMORY=${DOCKER_MEMORY:-}
+TRACKER_ENABLED=${TRACKER_ENABLED:-true}
+EOF
+            for i in $(seq 1 "$CONTAINER_COUNT"); do
+                local mc_var="MAX_CLIENTS_${i}"
+                local bw_var="BANDWIDTH_${i}"
+                [ -n "${!mc_var}" ] && echo "${mc_var}=${!mc_var}" >> "$tmp"
+                [ -n "${!bw_var}" ] && echo "${bw_var}=${!bw_var}" >> "$tmp"
+            done
+            mv "$tmp" "$settings_path"
+        fi
+        echo -e "${YELLOW}Tracker disabled${NC}"
+    else
+        TRACKER_ENABLED=true
+        if command -v save_settings >/dev/null 2>&1; then
+            save_settings
+        else
+            local settings_path="$INSTALL_DIR/settings.conf"
+            local tmp="${settings_path}.tmp.$$"
+            cat > "$tmp" << EOF
+MAX_CLIENTS=$MAX_CLIENTS
+BANDWIDTH=$BANDWIDTH
+CONTAINER_COUNT=$CONTAINER_COUNT
+CONTAINER_PORT_BASE=$CONTAINER_PORT_BASE
+DOCKER_CPUS=${DOCKER_CPUS:-}
+DOCKER_MEMORY=${DOCKER_MEMORY:-}
+TRACKER_ENABLED=${TRACKER_ENABLED:-true}
+EOF
+            for i in $(seq 1 "$CONTAINER_COUNT"); do
+                local mc_var="MAX_CLIENTS_${i}"
+                local bw_var="BANDWIDTH_${i}"
+                [ -n "${!mc_var}" ] && echo "${mc_var}=${!mc_var}" >> "$tmp"
+                [ -n "${!bw_var}" ] && echo "${bw_var}=${!bw_var}" >> "$tmp"
+            done
+            mv "$tmp" "$settings_path"
+        fi
+        setup_tracker_service
+        echo -e "${GREEN}Tracker enabled${NC}"
     fi
 }
 
@@ -2074,11 +2297,7 @@ get_node_id() {
             local key_b64
             key_b64=$(echo "$key_json" | grep "privateKeyBase64" | awk -F'"' '{print $4}')
             if [ -n "$key_b64" ]; then
-                local decoded
-                decoded=$(printf "%s" "$key_b64" | { base64 -d 2>/dev/null || base64 -D 2>/dev/null; } )
-                if [ -n "$decoded" ]; then
-                    printf "%s" "$decoded" | tail -c 32 | base64 | tr -d '=\n'
-                fi
+                printf "%s" "$key_b64" | { base64 -d 2>/dev/null || base64 -D 2>/dev/null; } | tail -c 32 | base64 | tr -d '=\n'
             fi
         fi
         return
@@ -2219,7 +2438,7 @@ show_container_dashboard() {
             printf "\033[J"
         fi
 
-        if read -t 4 -n 1 -s <> /dev/tty 2>/dev/null; then
+        if read -t 1 -n 1 -s <> /dev/tty 2>/dev/null; then
             stop_dashboard=1
         fi
     done
@@ -3636,6 +3855,7 @@ change_settings() {
             fi
         fi
     done
+    setup_tracker_service
 }
 
 change_resource_limits() {
@@ -3690,6 +3910,7 @@ change_resource_limits() {
             run_conduit_container "$i"
         done
         echo -e "  ${GREEN}✓ Resource limits cleared${NC}"
+        setup_tracker_service
         return
     fi
 
@@ -3755,6 +3976,7 @@ change_resource_limits() {
             echo -e "  ${RED}✗ Failed to update $(get_container_name "$i")${NC}"
         fi
     done
+    setup_tracker_service
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -3929,6 +4151,7 @@ show_menu() {
             echo -e "  g. 🌐 Update GeoIP database (DB-IP Lite)"
             echo ""
             echo -e "  h. 🩺 Health check"
+            echo -e "  t. 📡 Toggle background tracker"
             echo -e "  b. 💾 Backup node key"
             echo -e "  r. 📥 Restore node key"
             echo ""
@@ -3992,6 +4215,11 @@ show_menu() {
                 show_peers
                 redraw=true
                 ;;
+            t|T)
+                toggle_tracker
+                read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
+                redraw=true
+                ;;
             g|G)
                 update_geoip_db
                 read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
@@ -4045,6 +4273,7 @@ show_help() {
     echo "  stats     View live statistics"
     echo "  logs      View raw Docker logs"
     echo "  containers  Per-container dashboard"
+    echo "  tracker   Toggle background tracker"
     echo "  health    Run health check on Conduit container"
     echo "  start     Start Conduit container"
     echo "  stop      Stop Conduit container"
@@ -4391,6 +4620,7 @@ case "${1:-menu}" in
     peers)    show_peers ;;
     settings) change_settings ;;
     limits|resources) change_resource_limits ;;
+    tracker)  toggle_tracker ;;
     backup)   backup_key ;;
     restore)  restore_key ;;
     uninstall) uninstall_all ;;
@@ -4685,6 +4915,7 @@ main() {
     log_info "Step 4/5: Setting up auto-start..."
     save_settings
     setup_autostart
+    setup_tracker_service
 
     echo ""
 
