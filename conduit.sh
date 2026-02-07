@@ -31,7 +31,7 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
-VERSION="1.0.2-Mac"
+VERSION="1.1.0-Mac"
 CONDUIT_IMAGE="ghcr.io/ssmirr/conduit/conduit:latest"
 INSTALL_DIR="${INSTALL_DIR:-/opt/conduit}"
 # BACKUP_DIR depends on INSTALL_DIR and may be overridden during OS detection (e.g. macOS).
@@ -1413,7 +1413,7 @@ create_management_script() {
 # Reference: https://github.com/ssmirr/conduit/releases/tag/d8522a8
 #
 
-VERSION="1.0.2-Mac"
+VERSION="1.1.0-Mac"
 INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
 BACKUP_DIR="$INSTALL_DIR/backups"
 GEOIP_DIR="$INSTALL_DIR/geoip"
