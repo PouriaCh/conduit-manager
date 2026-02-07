@@ -2570,9 +2570,7 @@ If a container gets stuck and is auto-restarted, you will receive an immediate a
 🎮 *Available Commands:*
 ━━━━━━━━━━━━━━━━━━━━
 /status — Full status report on demand
-$([ "$OS_FAMILY" != "macos" ] && echo "/peers — Show connected & connecting clients
-")
-/uptime — Uptime for each container
+$([ "$OS_FAMILY" != "macos" ] && echo "/peers — Show connected & connecting clients")/uptime — Uptime for each container
 /containers — List all containers with status
 /start\_N — Start container N (e.g. /start\_1)
 /stop\_N — Stop container N (e.g. /stop\_2)
