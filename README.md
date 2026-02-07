@@ -36,7 +36,7 @@ conduit status       # Show current status
 conduit stats        # Live statistics
 conduit logs         # View Docker logs
 conduit health       # Run diagnostics
-conduit peers        # Live peer traffic by country (requires sudo)
+conduit peers        # Live peer traffic by country (requires sudo on macOS)
 
 conduit start        # Start container
 conduit stop         # Stop container
@@ -63,7 +63,8 @@ conduit uninstall    # Remove everything
 - Docker runs via **Docker Desktop** (not Docker Engine)
 - Uses **port publishing** (443/TCP+UDP) instead of host networking
 - **No auto-start on boot** (launchd not implemented yet)
-- `conduit peers` requires **sudo** (uses tcpdump)
+- **Live peers by country (Live Map)** requires **sudo** on macOS (`sudo conduit peers` or choose option 11 and confirm "Run with sudo now?"). The feature is not advertised in the Telegram bot on macOS.
+- **Zero-peers alert is disabled** on macOS in Telegram notifications due to unreliable peer tracking in the background notifier.
 - GeoIP uses free **DB-IP Lite** database (no account needed)
 
 ## Uninstall
