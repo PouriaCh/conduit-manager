@@ -2818,7 +2818,8 @@ If a container gets stuck and is auto-restarted, you will receive an immediate a
 🎮 *Available Commands:*
 ━━━━━━━━━━━━━━━━━━━━
 /status — Full status report on demand
-$([ "$OS_FAMILY" != "macos" ] && echo "/peers — Show connected & connecting clients")/uptime — Uptime for each container
+/peers — Show connected & connecting clients
+/uptime — Uptime for each container
 /containers — List all containers with status
 /start\_N — Start container N (e.g. /start\_1)
 /stop\_N — Stop container N (e.g. /stop\_2)
@@ -3221,26 +3222,22 @@ except Exception:
                 telegram_send "$report"
                 ;;
             /peers|/peers@*)
-                if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-                    telegram_send "⚠️ Live peers by country is not available in the macOS edition."
-                else
-                    local total_peers=0
-                    local total_cing=0
-                    local _debug_stat=""
-                    for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
-                        local cname=$(get_container_name $i)
-                        local last_stat=$(timeout 5 $DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "STATS" | tail -1)
-                        [ "$i" -eq 1 ] && _debug_stat="$last_stat"
-                        local peers=$(echo "$last_stat" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
-                        local cing=$(echo "$last_stat" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
-                        total_peers=$((total_peers + ${peers:-0}))
-                        total_cing=$((total_cing + ${cing:-0}))
-                    done
-                    mkdir -p "$INSTALL_DIR/traffic_stats"
-                    echo "last_stat=${_debug_stat}" > "$INSTALL_DIR/traffic_stats/.peers_debug"
-                    echo "total_peers=$total_peers total_cing=$total_cing" >> "$INSTALL_DIR/traffic_stats/.peers_debug"
-                    telegram_send "👥 Clients: ${total_peers} connected, ${total_cing} connecting"
-                fi
+                local total_peers=0
+                local total_cing=0
+                local _debug_stat=""
+                for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+                    local cname=$(get_container_name $i)
+                    local last_stat=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+                    [ "$i" -eq 1 ] && _debug_stat="$last_stat"
+                    local peers=$(echo "$last_stat" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
+                    local cing=$(echo "$last_stat" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
+                    total_peers=$((total_peers + ${peers:-0}))
+                    total_cing=$((total_cing + ${cing:-0}))
+                done
+                mkdir -p "$INSTALL_DIR/traffic_stats"
+                echo "last_stat=${_debug_stat}" > "$INSTALL_DIR/traffic_stats/.peers_debug"
+                echo "total_peers=$total_peers total_cing=$total_cing" >> "$INSTALL_DIR/traffic_stats/.peers_debug"
+                telegram_send "👥 Clients: ${total_peers} connected, ${total_cing} connecting"
                 ;;
             /uptime|/uptime@*)
                 local ut_msg="⏱ *Uptime Report*"
@@ -3278,7 +3275,7 @@ except Exception:
                     if echo "$docker_names" | grep -q "^${cname}$"; then
                         ct_msg+="C${i} (${cname}): 🟢 Running"
                         ct_msg+=$'\n'
-                        local logs=$(timeout 5 $DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "STATS" | tail -1)
+                        local logs=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
                         if [ -n "$logs" ]; then
                             local c_conn=$(echo "$logs" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
                             local c_cing=$(echo "$logs" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
@@ -4491,30 +4488,86 @@ show_peers_macos() {
     tput smcup 2>/dev/null || true
     echo -ne "\033[?25l"  # Hide cursor
     
+    local last_refresh=0
+    
     while [ $stop_peers -eq 0 ]; do
-        clear
-        printf "\033[H"
+        local now=$(date +%s)
+        local elapsed=$((now - last_refresh))
         
-        # Header
-        local update_time=$(date '+%H:%M:%S')
-        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║${NC}  LIVE PEER TRAFFIC BY COUNTRY                     [Any key: Exit]   ${CYAN}║${NC}"
-        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
-        printf "${CYAN}║${NC} Last Update: %-42s ${GREEN}[LIVE]${NC}        ${CYAN}║${NC}\n" "$update_time"
-        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        
-        # Read tracker data
-        local snapshot_file="$persist_dir/tracker_snapshot"
-        local cumulative_file="$persist_dir/cumulative_data"
-        
-        if [ -s "$snapshot_file" ] && [ -s "$cumulative_file" ]; then
-            # Count active clients per country from snapshot
+        # Only refresh data every 5 seconds
+        if [ $last_refresh -eq 0 ] || [ $elapsed -ge 5 ]; then
+            last_refresh=$now
+            
+            clear
+            printf "\033[H"
+            
+            # Header
+            local update_time=$(date '+%H:%M:%S')
+            echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${CYAN}║${NC}  LIVE PEER TRAFFIC BY COUNTRY                     [q] Back"
+            echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+            printf "${CYAN}║${NC} Last Update: %-42s ${GREEN}[LIVE]${NC}\n" "$update_time"
+            echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            
+            # Read tracker data
+            local snapshot_file="$persist_dir/tracker_snapshot"
+            local cumulative_file="$persist_dir/cumulative_data"
+            
+            if [ -s "$snapshot_file" ] && [ -s "$cumulative_file" ]; then
+            # Get ACTIVE clients per country from Docker /proc/net/tcp (real-time)
             declare -A country_clients
-            while IFS='|' read -r ip country; do
-                [ -z "$country" ] && continue
-                country_clients["$country"]=$((${country_clients["$country"]:-0} + 1))
-            done < "$snapshot_file"
+            local temp_active="/tmp/active_ips_$$.tmp"
+            > "$temp_active"
+            
+            # Extract currently active IPs from all containers
+            for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+                local cname="conduit"
+                [ $i -gt 1 ] && cname="conduit-$i"
+                
+                docker exec "$cname" cat /proc/net/tcp 2>/dev/null | tail -n +2 | while read line; do
+                    local rem_addr=$(echo "$line" | awk '{print $3}')
+                    local rem_ip_hex=$(echo "$rem_addr" | cut -d':' -f1)
+                    [ ${#rem_ip_hex} -ne 8 ] && continue
+                    
+                    # Convert hex to IP
+                    local ip=$(printf "%d.%d.%d.%d" 0x${rem_ip_hex:6:2} 0x${rem_ip_hex:4:2} 0x${rem_ip_hex:2:2} 0x${rem_ip_hex:0:2})
+                    echo "$ip" | grep -qE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)' && continue
+                    echo "$ip"
+                done >> "$temp_active"
+            done
+            
+            # Count unique active IPs per country using GeoIP
+            sort -u "$temp_active" | while read -r ip; do
+                [ -z "$ip" ] && continue
+                local country="Unknown"
+                
+                # GeoIP lookup
+                if command -v mmdblookup >/dev/null 2>&1; then
+                    local mmdb_path=""
+                    for db in "$INSTALL_DIR/geoip/dbip-country-lite.mmdb" \
+                              "$INSTALL_DIR/geoip/GeoLite2-Country.mmdb" \
+                              "/usr/local/share/GeoIP/dbip-country-lite.mmdb"; do
+                        if [ -f "$db" ]; then
+                            mmdb_path="$db"
+                            break
+                        fi
+                    done
+                    if [ -n "$mmdb_path" ]; then
+                        country=$(mmdblookup --file "$mmdb_path" --ip "$ip" country names en 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | head -1)
+                    fi
+                fi
+                [ -z "$country" ] && country="Unknown"
+                echo "$country"
+            done | sort | uniq -c | while read count country; do
+                echo "${country}|${count}"
+            done > "${temp_active}.counts"
+            
+            # Load active client counts
+            while IFS='|' read -r country count; do
+                country_clients["$country"]=$count
+            done < "${temp_active}.counts"
+            rm -f "$temp_active" "${temp_active}.counts"
             
             # Read cumulative traffic per country
             declare -A country_down country_up
@@ -4524,17 +4577,10 @@ show_peers_macos() {
                 country_up["$country"]=$up
             done < "$cumulative_file"
             
-            # Calculate total traffic for percentages
-            local total_up=0 total_down=0
-            for country in "${!country_up[@]}"; do
-                total_up=$((total_up + ${country_up[$country]:-0}))
-                total_down=$((total_down + ${country_down[$country]:-0}))
-            done
-            
             # Display TOP 10 TRAFFIC FROM (Download)
             echo -e " ${GREEN}${BOLD}📥 TOP 10 TRAFFIC FROM (peers connecting to you)${NC}"
             echo ""
-            printf " ${BOLD}%-26s${NC}  ${GREEN}${BOLD}%10s${NC}   %-12s\n" "Country" "Total" "Clients"
+            printf " ${BOLD}%-35s${NC}  ${GREEN}${BOLD}%12s${NC}   %-12s\n" "Country" "Total" "Clients"
             echo " ─────────────────────────────────────────────────────────────────────────"
             
             # Sort by download (from)
@@ -4542,7 +4588,7 @@ show_peers_macos() {
                 echo "${country}|${country_down[$country]}|${country_clients[$country]:-0}"
             done | sort -t'|' -k2 -rn | head -10 | while IFS='|' read -r country down clients; do
                 local down_fmt=$(format_bytes "$down")
-                printf " ${CYAN}%-26s${NC}  ${GREEN}${BOLD}%10s${NC}   %-12s\n" "$country" "$down_fmt" "$clients"
+                printf " ${CYAN}%-35s${NC}  ${GREEN}${BOLD}%12s${NC}   %-12s\n" "$country" "$down_fmt" "$clients"
             done
             
             echo ""
@@ -4551,7 +4597,7 @@ show_peers_macos() {
             # Display TOP 10 TRAFFIC TO (Upload)
             echo -e " ${YELLOW}${BOLD}📤 TOP 10 TRAFFIC TO (data sent to peers)${NC}"
             echo ""
-            printf " ${BOLD}%-26s${NC}  ${YELLOW}${BOLD}%10s${NC}   %-12s\n" "Country" "Total" "Clients"
+            printf " ${BOLD}%-35s${NC}  ${YELLOW}${BOLD}%12s${NC}   %-12s\n" "Country" "Total" "Clients"
             echo " ─────────────────────────────────────────────────────────────────────────"
             
             # Sort by upload (to)
@@ -4559,21 +4605,43 @@ show_peers_macos() {
                 echo "${country}|${country_up[$country]}|${country_clients[$country]:-0}"
             done | sort -t'|' -k2 -rn | head -10 | while IFS='|' read -r country up clients; do
                 local up_fmt=$(format_bytes "$up")
-                printf " ${CYAN}%-26s${NC}  ${YELLOW}${BOLD}%10s${NC}   %-12s\n" "$country" "$up_fmt" "$clients"
+                printf " ${CYAN}%-35s${NC}  ${YELLOW}${BOLD}%12s${NC}   %-12s\n" "$country" "$up_fmt" "$clients"
             done
         else
             echo -e "   ${YELLOW}Waiting for tracker data...${NC}"
             for i in {1..20}; do echo ""; done
         fi
         
+        # Add empty lines to match Linux layout
         echo ""
-        echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${DIM}Display refreshes every 5s. Tracker updates every 60s. Press any key to exit.${NC}"
-        
-        # Wait for user input or 5 seconds
-        if read -t 5 -n 1 -s <> /dev/tty 2>/dev/null; then
-            stop_peers=1
+        for i in {1..11}; do echo ""; done
         fi
+        
+        # Continuously update progress bar until next refresh
+        while true; do
+            local now=$(date +%s)
+            local time_left=$((5 - (now - last_refresh)))
+            
+            # Time for next refresh?
+            if [ $time_left -le 0 ]; then
+                break
+            fi
+            
+            # Draw progress bar
+            local filled=$((5 - time_left))
+            echo -ne "\r["
+            for ((i=0; i<filled; i++)); do echo -n "●"; done
+            for ((i=filled; i<5; i++)); do echo -n "○"; done
+            echo -ne "] Next refresh in ${time_left}s  [q] Back   "
+            
+            # Check for user input (non-blocking, 200ms wait)
+            if read -t 0.2 -n 1 -s key <> /dev/tty 2>/dev/null; then
+                [ "$key" = "q" ] || [ "$key" = "Q" ] && stop_peers=1
+                break
+            fi
+        done
+        
+        [ $stop_peers -eq 1 ] && break
     done
     
     # Cleanup
@@ -5522,6 +5590,12 @@ show_status() {
         echo -e "  Auto-start:   ${GREEN}Enabled (systemd)${NC}"
         local svc_status=$(systemctl is-active conduit.service 2>/dev/null)
         echo -e "  Service:      ${svc_status:-unknown}"
+        # Check tracker status
+        if pgrep -f "conduit-tracker.sh" >/dev/null 2>&1; then
+            echo -e "  Tracker:      ${GREEN}Active${NC}"
+        else
+            echo -e "  Tracker:      ${YELLOW}Inactive${NC}"
+        fi
     # Check for OpenRC
     elif command -v rc-status &>/dev/null && rc-status -a 2>/dev/null | grep -q "conduit"; then
         echo -e "  Auto-start:   ${GREEN}Enabled (OpenRC)${NC}"
@@ -5530,8 +5604,138 @@ show_status() {
         echo -e "  Auto-start:   ${GREEN}Enabled (SysVinit)${NC}"
     else
         echo -e "  Auto-start:   ${YELLOW}Not configured${NC}"
-        echo -e "  Note:         Docker restart policy handles restarts"
+        if [ "$OS_FAMILY" = "macos" ]; then
+            echo -e "  Note:         Docker restart policy handles restarts"
+        fi
+        # Check tracker status for non-systemd systems
+        if pgrep -f "conduit-tracker.sh" >/dev/null 2>&1; then
+            echo -e "  Tracker:      ${GREEN}Active${NC}"
+        else
+            echo -e "  Tracker:      ${YELLOW}Inactive${NC}"
+        fi
     fi
+    
+    # Display active clients and top upload stats (if tracker data available)
+    local cumulative_file="$PERSIST_DIR/cumulative_data"
+    if [ -s "$cumulative_file" ]; then
+        echo ""
+        
+        # Read cumulative traffic data
+        declare -A country_up country_down
+        while IFS='|' read -r country down up; do
+            [ -z "$country" ] && continue
+            country_down["$country"]=$down
+            country_up["$country"]=$up
+        done < "$cumulative_file"
+        
+        # Get active clients per country
+        declare -A country_clients
+        local temp_active="/tmp/active_ips_status_$$.tmp"
+        > "$temp_active"
+        
+        for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+            local cname="conduit"
+            [ $i -gt 1 ] && cname="conduit-$i"
+            
+            docker exec "$cname" cat /proc/net/tcp 2>/dev/null | tail -n +2 | while read line; do
+                local rem_addr=$(echo "$line" | awk '{print $3}')
+                local rem_ip_hex=$(echo "$rem_addr" | cut -d':' -f1)
+                [ ${#rem_ip_hex} -ne 8 ] && continue
+                
+                local ip=$(printf "%d.%d.%d.%d" 0x${rem_ip_hex:6:2} 0x${rem_ip_hex:4:2} 0x${rem_ip_hex:2:2} 0x${rem_ip_hex:0:2})
+                echo "$ip" | grep -qE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)' && continue
+                echo "$ip"
+            done >> "$temp_active"
+        done
+        
+        # Count active clients per country
+        if [ -s "$temp_active" ]; then
+            sort -u "$temp_active" | while read -r ip; do
+                [ -z "$ip" ] && continue
+                local country="Unknown"
+                
+                if command -v mmdblookup >/dev/null 2>&1; then
+                    local mmdb_path=""
+                    for db in "$INSTALL_DIR/geoip/dbip-country-lite.mmdb" \
+                              "$INSTALL_DIR/geoip/GeoLite2-Country.mmdb" \
+                              "/usr/local/share/GeoIP/dbip-country-lite.mmdb"; do
+                        if [ -f "$db" ]; then
+                            mmdb_path="$db"
+                            break
+                        fi
+                    done
+                    if [ -n "$mmdb_path" ]; then
+                        country=$(mmdblookup --file "$mmdb_path" --ip "$ip" country names en 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | head -1)
+                    fi
+                fi
+                [ -z "$country" ] && country="Unknown"
+                echo "$country"
+            done | sort | uniq -c | while read count country; do
+                echo "${country}|${count}"
+            done > "${temp_active}.counts"
+            
+            while IFS='|' read -r country count; do
+                country_clients["$country"]=$count
+            done < "${temp_active}.counts"
+            rm -f "${temp_active}.counts"
+        fi
+        rm -f "$temp_active"
+        
+        # Calculate totals
+        local total_active_clients=0
+        for country in "${!country_clients[@]}"; do
+            total_active_clients=$((total_active_clients + ${country_clients[$country]:-0}))
+        done
+        
+        local total_upload=0
+        for country in "${!country_up[@]}"; do
+            total_upload=$((total_upload + ${country_up[$country]:-0}))
+        done
+        
+        # Display side-by-side tables
+        echo -e "  ${BOLD}ACTIVE CLIENTS${NC}                 ${BOLD}TOP 5 UPLOAD (cumulative)${NC}"
+        
+        # Get top 5 by active clients
+        local active_top5=()
+        for country in "${!country_clients[@]}"; do
+            local count=${country_clients[$country]:-0}
+            local pct=0
+            [ $total_active_clients -gt 0 ] && pct=$((count * 100 / total_active_clients))
+            echo "${pct}|${count}|${country}"
+        done | sort -t'|' -k1 -rn | head -5 | while IFS='|' read -r pct count country; do
+            # Truncate country name to 12 chars
+            local country_short="${country:0:12}"
+            local bar_len=$((pct / 25))
+            [ $bar_len -gt 4 ] && bar_len=4
+            local bar=$(printf '█%.0s' $(seq 1 $bar_len))
+            printf "  %-12s %3s%% %-4s %6s" "$country_short" "$pct" "$bar" "$count"
+            echo ""
+        done > /tmp/active_$$
+        
+        # Get top 5 by upload
+        for country in "${!country_up[@]}"; do
+            local up=${country_up[$country]:-0}
+            local pct=0
+            [ $total_upload -gt 0 ] && pct=$((up * 100 / total_upload))
+            echo "${pct}|${up}|${country}"
+        done | sort -t'|' -k1 -rn | head -5 | while IFS='|' read -r pct up country; do
+            local country_short="${country:0:12}"
+            local bar_len=$((pct / 25))
+            [ $bar_len -gt 4 ] && bar_len=4
+            local bar=$(printf '█%.0s' $(seq 1 $bar_len))
+            local up_fmt=$(format_bytes "$up")
+            printf "   %-12s %3s%% %-4s %12s" "$country_short" "$pct" "$bar" "$up_fmt"
+            echo ""
+        done > /tmp/upload_$$
+        
+        # Merge and display side by side
+        paste /tmp/active_$$ /tmp/upload_$$ | while IFS=$'\t' read -r left right; do
+            printf "%s%s\n" "$left" "$right"
+        done
+        
+        rm -f /tmp/active_$$ /tmp/upload_$$
+    fi
+    
     echo ""
 }
 
