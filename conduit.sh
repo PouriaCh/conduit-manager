@@ -4467,31 +4467,131 @@ format_bytes_compact() {
     fi
 }
 
+# show_peers_macos() - macOS version using tracker data instead of tcpdump
+show_peers_macos() {
+    local stop_peers=0
+    trap 'stop_peers=1' SIGINT SIGTERM
+    
+    local persist_dir="$INSTALL_DIR/traffic_stats"
+    
+    # Check if tracker is running and has data
+    if [ ! -f "$persist_dir/tracker_snapshot" ] || [ ! -f "$persist_dir/cumulative_data" ]; then
+        clear
+        print_header
+        echo -e "${YELLOW}═══ LIVE PEER MAP ═══${NC}"
+        echo ""
+        echo -e "${RED}Tracker data not available.${NC}"
+        echo -e "Make sure the tracker is enabled and running (press 'd' from main menu)."
+        echo ""
+        read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
+        return 1
+    fi
+    
+    # Enter alternate screen buffer
+    tput smcup 2>/dev/null || true
+    echo -ne "\033[?25l"  # Hide cursor
+    
+    while [ $stop_peers -eq 0 ]; do
+        clear
+        printf "\033[H"
+        
+        # Header
+        local update_time=$(date '+%H:%M:%S')
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${NC}  LIVE PEER TRAFFIC BY COUNTRY                     [Any key: Exit]   ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        printf "${CYAN}║${NC} Last Update: %-42s ${GREEN}[LIVE]${NC}        ${CYAN}║${NC}\n" "$update_time"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        
+        # Read tracker data
+        local snapshot_file="$persist_dir/tracker_snapshot"
+        local cumulative_file="$persist_dir/cumulative_data"
+        
+        if [ -s "$snapshot_file" ] && [ -s "$cumulative_file" ]; then
+            # Count active clients per country from snapshot
+            declare -A country_clients
+            while IFS='|' read -r ip country; do
+                [ -z "$country" ] && continue
+                country_clients["$country"]=$((${country_clients["$country"]:-0} + 1))
+            done < "$snapshot_file"
+            
+            # Read cumulative traffic per country
+            declare -A country_down country_up
+            while IFS='|' read -r country down up; do
+                [ -z "$country" ] && continue
+                country_down["$country"]=$down
+                country_up["$country"]=$up
+            done < "$cumulative_file"
+            
+            # Calculate total traffic for percentages
+            local total_up=0 total_down=0
+            for country in "${!country_up[@]}"; do
+                total_up=$((total_up + ${country_up[$country]:-0}))
+                total_down=$((total_down + ${country_down[$country]:-0}))
+            done
+            
+            # Display TOP 10 TRAFFIC FROM (Download)
+            echo -e " ${GREEN}${BOLD}📥 TOP 10 TRAFFIC FROM (peers connecting to you)${NC}"
+            echo ""
+            printf " ${BOLD}%-26s${NC}  ${GREEN}${BOLD}%10s${NC}   %-12s\n" "Country" "Total" "Clients"
+            echo " ─────────────────────────────────────────────────────────────────────────"
+            
+            # Sort by download (from)
+            for country in "${!country_down[@]}"; do
+                echo "${country}|${country_down[$country]}|${country_clients[$country]:-0}"
+            done | sort -t'|' -k2 -rn | head -10 | while IFS='|' read -r country down clients; do
+                local down_fmt=$(format_bytes "$down")
+                printf " ${CYAN}%-26s${NC}  ${GREEN}${BOLD}%10s${NC}   %-12s\n" "$country" "$down_fmt" "$clients"
+            done
+            
+            echo ""
+            echo ""
+            
+            # Display TOP 10 TRAFFIC TO (Upload)
+            echo -e " ${YELLOW}${BOLD}📤 TOP 10 TRAFFIC TO (data sent to peers)${NC}"
+            echo ""
+            printf " ${BOLD}%-26s${NC}  ${YELLOW}${BOLD}%10s${NC}   %-12s\n" "Country" "Total" "Clients"
+            echo " ─────────────────────────────────────────────────────────────────────────"
+            
+            # Sort by upload (to)
+            for country in "${!country_up[@]}"; do
+                echo "${country}|${country_up[$country]}|${country_clients[$country]:-0}"
+            done | sort -t'|' -k2 -rn | head -10 | while IFS='|' read -r country up clients; do
+                local up_fmt=$(format_bytes "$up")
+                printf " ${CYAN}%-26s${NC}  ${YELLOW}${BOLD}%10s${NC}   %-12s\n" "$country" "$up_fmt" "$clients"
+            done
+        else
+            echo -e "   ${YELLOW}Waiting for tracker data...${NC}"
+            for i in {1..20}; do echo ""; done
+        fi
+        
+        echo ""
+        echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${DIM}Display refreshes every 5s. Tracker updates every 60s. Press any key to exit.${NC}"
+        
+        # Wait for user input or 5 seconds
+        if read -t 5 -n 1 -s <> /dev/tty 2>/dev/null; then
+            stop_peers=1
+        fi
+    done
+    
+    # Cleanup
+    echo -ne "\033[?25h"  # Show cursor
+    tput rmcup 2>/dev/null || true
+    return 0
+}
+
 # show_peers() - Live peer traffic by country using Docker /proc/net/tcp + GeoIP
 # Works without sudo on macOS
 show_peers() {
     local is_darwin=0
     [ "$(uname -s 2>/dev/null)" = "Darwin" ] && is_darwin=1
 
-    # On macOS, inform user that Live Map is not available but alternatives exist
+    # On macOS, use tracker data instead of tcpdump
     if [ $is_darwin -eq 1 ]; then
-        clear
-        print_header
-        echo -e "${YELLOW}═══ LIVE PEER MAP ═══${NC}"
-        echo ""
-        echo -e "${CYAN}The live peer map uses real-time packet capture which requires${NC}"
-        echo -e "${CYAN}elevated privileges (sudo + tcpdump) on macOS.${NC}"
-        echo ""
-        echo -e "${GREEN}✓ Your tracker is already collecting peer data in the background!${NC}"
-        echo ""
-        echo -e "${BOLD}To view peer statistics by country:${NC}"
-        echo -e "  • ${CYAN}Telegram Bot${NC}: Send ${BOLD}/status${NC} command"
-        echo -e "  • ${CYAN}Dashboard${NC}: Press ${BOLD}1${NC} from main menu"
-        echo ""
-        echo -e "${YELLOW}Note: Traffic data is updated every minute by the background tracker.${NC}"
-        echo ""
-        read -n 1 -s -r -p "Press any key to return to menu..." < /dev/tty || true
-        return 0
+        show_peers_macos
+        return $?
     fi
 
     # Linux version continues with tcpdump-based live map
