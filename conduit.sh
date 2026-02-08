@@ -37,6 +37,25 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/conduit}"
 # BACKUP_DIR depends on INSTALL_DIR and may be overridden during OS detection (e.g. macOS).
 BACKUP_DIR=""
 STATS_FILE="/home/conduit/data/conduit_stats.json"
+
+# Helper function to fix file ownership when running as root
+# This prevents permission issues when scripts run with sudo
+fix_file_ownership() {
+    local file="$1"
+    [ ! -e "$file" ] && return 0
+    
+    # Only fix if running as root via sudo
+    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+        chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$file" 2>/dev/null || true
+    fi
+}
+
+# Helper function to ensure directory exists with correct ownership
+ensure_dir() {
+    local dir="$1"
+    mkdir -p "$dir" 2>/dev/null || true
+    fix_file_ownership "$dir"
+}
 FORCE_REINSTALL=false
 PERSIST_DIR="$INSTALL_DIR/traffic_stats"
 CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
@@ -2100,125 +2119,339 @@ stop_tracker_service() {
 }
 
 regenerate_tracker_script() {
-    cat > "$INSTALL_DIR/conduit-tracker.sh" << EOF
-#!/bin/bash
-INSTALL_DIR="$INSTALL_DIR"
+    cat > "$INSTALL_DIR/conduit-tracker.sh" << 'EOF'
+#!/opt/homebrew/bin/bash
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.conduit}"
+
+# Load settings
+if [ -f "$INSTALL_DIR/settings.conf" ]; then
+    source "$INSTALL_DIR/settings.conf"
+fi
+
 CONTAINER_COUNT="${CONTAINER_COUNT:-1}"
-PERSIST_DIR="$PERSIST_DIR"
-CONNECTION_HISTORY_FILE="$CONNECTION_HISTORY_FILE"
-CONNECTION_HISTORY_START_FILE="$CONNECTION_HISTORY_START_FILE"
-PEAK_CONNECTIONS_FILE="$PEAK_CONNECTIONS_FILE"
+PERSIST_DIR="${PERSIST_DIR:-$INSTALL_DIR/traffic_stats}"
+CONNECTION_HISTORY_FILE="${CONNECTION_HISTORY_FILE:-$PERSIST_DIR/connection_history}"
+CONNECTION_HISTORY_START_FILE="${CONNECTION_HISTORY_START_FILE:-$PERSIST_DIR/connection_history_start}"
+PEAK_CONNECTIONS_FILE="${PEAK_CONNECTIONS_FILE:-$PERSIST_DIR/peak_connections}"
 _LAST_HISTORY_RECORD=0
 _PEAK_CONNECTIONS=0
 _PEAK_CONTAINER_START=""
 _AVG_CONN_CACHE=""
 _AVG_CONN_CACHE_TIME=0
 
+# Helper function to fix file ownership when running as root
+fix_file_ownership() {
+    local file="$1"
+    [ ! -e "$file" ] && return 0
+    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+        chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$file" 2>/dev/null || true
+    fi
+}
+
+# Docker binary detection
+DOCKER_BIN=""
+for candidate in docker podman; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        DOCKER_BIN="$candidate"
+        break
+    fi
+done
+[ -z "$DOCKER_BIN" ] && exit 1
+
 get_container_name() {
-    local idx=\${1:-1}
-    if [ "\$idx" -eq 1 ]; then
+    local idx=${1:-1}
+    if [ "$idx" -eq 1 ]; then
         echo "conduit"
     else
-        echo "conduit-\${idx}"
+        echo "conduit-${idx}"
     fi
 }
 
 get_container_start_time() {
     local earliest=""
-    for i in \$(seq 1 \${CONTAINER_COUNT:-1}); do
-        local cname=\$(get_container_name \$i 2>/dev/null)
-        [ -z "\$cname" ] && continue
-        local start=\$(docker inspect --format='{{.State.StartedAt}}' "\$cname" 2>/dev/null | cut -d'.' -f1)
-        [ -z "\$start" ] && continue
-        if [ -z "\$earliest" ] || [[ "\$start" < "\$earliest" ]]; then
-            earliest="\$start"
+    for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+        local cname=$(get_container_name $i 2>/dev/null)
+        [ -z "$cname" ] && continue
+        local start=$($DOCKER_BIN inspect --format='{{.State.StartedAt}}' "$cname" 2>/dev/null | cut -d'.' -f1)
+        [ -z "$start" ] && continue
+        if [ -z "$earliest" ] || [[ "$start" < "$earliest" ]]; then
+            earliest="$start"
         fi
     done
-    echo "\$earliest"
+    echo "$earliest"
 }
 
 load_peak_connections() {
-    local current_start=\$(get_container_start_time)
-    if [ -f "\$PEAK_CONNECTIONS_FILE" ]; then
-        local saved_start=\$(head -1 "\$PEAK_CONNECTIONS_FILE" 2>/dev/null)
-        local saved_peak=\$(tail -1 "\$PEAK_CONNECTIONS_FILE" 2>/dev/null)
-        if [ "\$saved_start" = "\$current_start" ] && [ -n "\$saved_peak" ]; then
-            _PEAK_CONNECTIONS=\$saved_peak
-            _PEAK_CONTAINER_START="\$current_start"
+    local current_start=$(get_container_start_time)
+    if [ -f "$PEAK_CONNECTIONS_FILE" ]; then
+        local saved_start=$(head -1 "$PEAK_CONNECTIONS_FILE" 2>/dev/null)
+        local saved_peak=$(tail -1 "$PEAK_CONNECTIONS_FILE" 2>/dev/null)
+        if [ "$saved_start" = "$current_start" ] && [ -n "$saved_peak" ]; then
+            _PEAK_CONNECTIONS=$saved_peak
+            _PEAK_CONTAINER_START="$current_start"
             return
         fi
     fi
     _PEAK_CONNECTIONS=0
-    _PEAK_CONTAINER_START="\$current_start"
+    _PEAK_CONTAINER_START="$current_start"
     save_peak_connections
 }
 
 save_peak_connections() {
-    mkdir -p "\$(dirname "\$PEAK_CONNECTIONS_FILE")" 2>/dev/null
-    echo "\$_PEAK_CONTAINER_START" > "\$PEAK_CONNECTIONS_FILE"
-    echo "\$_PEAK_CONNECTIONS" >> "\$PEAK_CONNECTIONS_FILE"
+    mkdir -p "$(dirname "$PEAK_CONNECTIONS_FILE")" 2>/dev/null
+    echo "$_PEAK_CONTAINER_START" > "$PEAK_CONNECTIONS_FILE"
+    echo "$_PEAK_CONNECTIONS" >> "$PEAK_CONNECTIONS_FILE"
+    fix_file_ownership "$PEAK_CONNECTIONS_FILE"
 }
 
 check_connection_history_reset() {
-    local current_start=\$(get_container_start_time)
-    if [ -f "\$CONNECTION_HISTORY_START_FILE" ]; then
-        local saved_start=\$(cat "\$CONNECTION_HISTORY_START_FILE" 2>/dev/null)
-        if [ "\$saved_start" = "\$current_start" ] && [ -n "\$saved_start" ]; then
+    local current_start=$(get_container_start_time)
+    if [ -f "$CONNECTION_HISTORY_START_FILE" ]; then
+        local saved_start=$(cat "$CONNECTION_HISTORY_START_FILE" 2>/dev/null)
+        if [ "$saved_start" = "$current_start" ] && [ -n "$saved_start" ]; then
             return
         fi
     fi
-    mkdir -p "\$(dirname "\$CONNECTION_HISTORY_START_FILE")" 2>/dev/null
-    echo "\$current_start" > "\$CONNECTION_HISTORY_START_FILE"
-    rm -f "\$CONNECTION_HISTORY_FILE" 2>/dev/null
+    mkdir -p "$(dirname "$CONNECTION_HISTORY_START_FILE")" 2>/dev/null
+    echo "$current_start" > "$CONNECTION_HISTORY_START_FILE"
+    fix_file_ownership "$CONNECTION_HISTORY_START_FILE"
+    rm -f "$CONNECTION_HISTORY_FILE" 2>/dev/null
     _AVG_CONN_CACHE=""
     _AVG_CONN_CACHE_TIME=0
 }
 
 record_connection_history() {
-    local connected=\$1
-    local connecting=\$2
-    local now=\$(date +%s)
-    if [ \$(( now - _LAST_HISTORY_RECORD )) -lt 300 ]; then
+    local connected=$1
+    local connecting=$2
+    local now=$(date +%s)
+    if [ $(( now - _LAST_HISTORY_RECORD )) -lt 300 ]; then
         return
     fi
-    _LAST_HISTORY_RECORD=\$now
+    _LAST_HISTORY_RECORD=$now
     check_connection_history_reset
-    mkdir -p "\$(dirname "\$CONNECTION_HISTORY_FILE")" 2>/dev/null
-    echo "\${now}|\${connected}|\${connecting}" >> "\$CONNECTION_HISTORY_FILE"
-    local cutoff=\$((now - 90000))
-    if [ -f "\$CONNECTION_HISTORY_FILE" ]; then
-        awk -F'|' -v cutoff="\$cutoff" '\$1 >= cutoff' "\$CONNECTION_HISTORY_FILE" > "\${CONNECTION_HISTORY_FILE}.tmp" 2>/dev/null
-        mv -f "\${CONNECTION_HISTORY_FILE}.tmp" "\$CONNECTION_HISTORY_FILE" 2>/dev/null
+    mkdir -p "$(dirname "$CONNECTION_HISTORY_FILE")" 2>/dev/null
+    echo "${now}|${connected}|${connecting}" >> "$CONNECTION_HISTORY_FILE"
+    fix_file_ownership "$CONNECTION_HISTORY_FILE"
+    local cutoff=$((now - 90000))
+    if [ -f "$CONNECTION_HISTORY_FILE" ]; then
+        awk -F'|' -v cutoff="$cutoff" '$1 >= cutoff' "$CONNECTION_HISTORY_FILE" > "${CONNECTION_HISTORY_FILE}.tmp" 2>/dev/null
+        mv -f "${CONNECTION_HISTORY_FILE}.tmp" "$CONNECTION_HISTORY_FILE" 2>/dev/null
+        fix_file_ownership "$CONNECTION_HISTORY_FILE"
     fi
 }
 
 get_totals() {
     local total_connected=0
     local total_connecting=0
-    for i in \$(seq 1 "\$CONTAINER_COUNT"); do
-        local cname=\$(get_container_name "\$i")
-        local logs=\$(docker logs --tail 200 "\$cname" 2>/dev/null | grep "STATS" | tail -1)
-        [ -z "\$logs" ] && continue
-        local cing=\$(echo "\$logs" | sed -n 's/.*Connecting:[[:space:]]*\\([0-9]*\\).*/\\1/p')
-        local conn=\$(echo "\$logs" | sed -n 's/.*Connected:[[:space:]]*\\([0-9]*\\).*/\\1/p')
-        cing=\${cing:-0}
-        conn=\${conn:-0}
-        total_connecting=\$((total_connecting + cing))
-        total_connected=\$((total_connected + conn))
+    for i in $(seq 1 "$CONTAINER_COUNT"); do
+        local cname=$(get_container_name "$i")
+        local logs=$($DOCKER_BIN logs --tail 200 "$cname" 2>/dev/null | grep "\[STATS\]" | tail -1)
+        [ -z "$logs" ] && continue
+        local cing=$(echo "$logs" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
+        local conn=$(echo "$logs" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
+        cing=${cing:-0}
+        conn=${conn:-0}
+        total_connecting=$((total_connecting + cing))
+        total_connected=$((total_connected + conn))
     done
-    echo "\${total_connected}|\${total_connecting}"
+    echo "${total_connected}|${total_connecting}"
 }
 
+# Helper function to convert hex IP to decimal format (little-endian)
+hex_to_ip() {
+    local hex="$1"
+    printf "%d.%d.%d.%d" \
+        0x${hex:6:2} 0x${hex:4:2} 0x${hex:2:2} 0x${hex:0:2}
+}
+
+# Traffic tracking using Docker /proc/net/tcp inspection (no sudo required)
+update_traffic_stats() {
+    mkdir -p "$PERSIST_DIR"
+    local cumulative_file="$PERSIST_DIR/cumulative_data"
+    local snapshot_file="$PERSIST_DIR/tracker_snapshot"
+    local container_start_file="$PERSIST_DIR/container_start"
+    
+    # Check if we can write to files (fix ownership issues from sudo runs)
+    if [ -f "$cumulative_file" ] && [ ! -w "$cumulative_file" ]; then
+        chmod u+w "$cumulative_file" 2>/dev/null || rm -f "$cumulative_file" 2>/dev/null || true
+    fi
+    if [ -f "$snapshot_file" ] && [ ! -w "$snapshot_file" ]; then
+        chmod u+w "$snapshot_file" 2>/dev/null || rm -f "$snapshot_file" 2>/dev/null || true
+    fi
+    if [ -f "$container_start_file" ] && [ ! -w "$container_start_file" ]; then
+        chmod u+w "$container_start_file" 2>/dev/null || rm -f "$container_start_file" 2>/dev/null || true
+    fi
+    
+    # Get current container start time
+    local current_start=$(get_container_start_time)
+    local stored_start=""
+    [ -f "$container_start_file" ] && stored_start=$(cat "$container_start_file")
+    
+    # If container restarted, reset cumulative data
+    if [ "$current_start" != "$stored_start" ]; then
+        echo "$current_start" > "$container_start_file"
+        fix_file_ownership "$container_start_file"
+        > "$cumulative_file"
+        > "$snapshot_file"
+    fi
+    
+    # Extract active IPs from /proc/net/tcp inside containers
+    > "$snapshot_file"
+    local temp_ips="/tmp/tracker_ips_$$.tmp"
+    local temp_tcp="/tmp/tracker_tcp_$$.tmp"
+    > "$temp_ips"
+    
+    for i in $(seq 1 "$CONTAINER_COUNT"); do
+        local cname=$(get_container_name "$i")
+        
+        # Get /proc/net/tcp data and save to temp file
+        $DOCKER_BIN exec "$cname" cat /proc/net/tcp 2>/dev/null > "$temp_tcp"
+        
+        # Process the file (skip header line)
+        tail -n +2 "$temp_tcp" | while read line; do
+            # Extract remote address (3rd column: rem_address)
+            local rem_addr=$(echo "$line" | awk '{print $3}')
+            local rem_ip_hex=$(echo "$rem_addr" | cut -d':' -f1)
+            
+            # Skip if empty or invalid
+            [ -z "$rem_ip_hex" ] && continue
+            [ ${#rem_ip_hex} -ne 8 ] && continue
+            
+            # Convert hex to IP
+            local ip=$(hex_to_ip "$rem_ip_hex")
+            
+            # Skip private/local IPs
+            echo "$ip" | grep -qE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)' && continue
+            
+            echo "$ip"
+        done >> "$temp_ips"
+    done
+    rm -f "$temp_tcp"
+    
+    # Get unique IPs and do GeoIP lookup
+    sort -u "$temp_ips" | while read -r ip; do
+        [ -z "$ip" ] && continue
+        
+        # Try to get country for this IP (GeoIP)
+        local country="Unknown"
+        if command -v mmdblookup >/dev/null 2>&1; then
+            local mmdb_path="${GEOIP_DB_PATH:-}"
+            # Try multiple paths in order of preference
+            if [ -z "$mmdb_path" ] || [ ! -f "$mmdb_path" ]; then
+                for db in "$INSTALL_DIR/geoip/dbip-country-lite.mmdb" \
+                          "$INSTALL_DIR/geoip/GeoLite2-Country.mmdb" \
+                          "/usr/local/share/GeoIP/dbip-country-lite.mmdb" \
+                          "/usr/share/GeoIP/dbip-country-lite.mmdb"; do
+                    if [ -f "$db" ]; then
+                        mmdb_path="$db"
+                        break
+                    fi
+                done
+            fi
+            if [ -n "$mmdb_path" ] && [ -f "$mmdb_path" ]; then
+                country=$(mmdblookup --file "$mmdb_path" --ip "$ip" country names en 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' | head -1)
+                [ -z "$country" ] && country="Unknown"
+            fi
+        elif command -v geoiplookup >/dev/null 2>&1; then
+            country=$(geoiplookup "$ip" 2>/dev/null | awk -F': ' '{print $2}' | head -1)
+            [ -z "$country" ] && country="Unknown"
+        fi
+        
+        # Normalize country names
+        country=$(echo "$country" | sed 's/Iran, Islamic Republic of/Iran - #FreeIran/' | sed 's/Moldova, Republic of/Moldova/')
+        
+        # Add to snapshot (IP|Country)
+        echo "${ip}|${country}" >> "$snapshot_file"
+    done
+    rm -f "$temp_ips"
+    fix_file_ownership "$snapshot_file"
+    
+    # Update cumulative_data from Docker STATS (Up/Down bytes from container logs)
+    local total_up=0
+    local total_down=0
+    
+    for i in $(seq 1 "$CONTAINER_COUNT"); do
+        local cname=$(get_container_name "$i")
+        local stat_line=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        
+        if [ -n "$stat_line" ]; then
+            # Extract Up: and Down: values (e.g., "Up: 12.90 GB | Down: 120.70 GB")
+            local up_str=$(echo "$stat_line" | sed -n 's/.*Up:[[:space:]]*\([^|]*\).*/\1/p' | xargs)
+            local down_str=$(echo "$stat_line" | sed -n 's/.*Down:[[:space:]]*\([^|]*\).*/\1/p' | xargs)
+            
+            # Convert to bytes
+            if [ -n "$up_str" ]; then
+                local up_val=$(echo "$up_str" | awk '{print $1}')
+                local up_unit=$(echo "$up_str" | awk '{print $2}')
+                local up_bytes=$(awk -v val="$up_val" -v unit="$up_unit" 'BEGIN{
+                    u=toupper(unit); gsub(/I/,"",u);
+                    if (u ~ /^TB/) val*=1099511627776;
+                    else if (u ~ /^GB/) val*=1073741824;
+                    else if (u ~ /^MB/) val*=1048576;
+                    else if (u ~ /^KB/) val*=1024;
+                    printf "%.0f", val
+                }')
+                total_up=$((total_up + up_bytes))
+            fi
+            
+            if [ -n "$down_str" ]; then
+                local down_val=$(echo "$down_str" | awk '{print $1}')
+                local down_unit=$(echo "$down_str" | awk '{print $2}')
+                local down_bytes=$(awk -v val="$down_val" -v unit="$down_unit" 'BEGIN{
+                    u=toupper(unit); gsub(/I/,"",u);
+                    if (u ~ /^TB/) val*=1099511627776;
+                    else if (u ~ /^GB/) val*=1073741824;
+                    else if (u ~ /^MB/) val*=1048576;
+                    else if (u ~ /^KB/) val*=1024;
+                    printf "%.0f", val
+                }')
+                total_down=$((total_down + down_bytes))
+            fi
+        fi
+    done
+    
+    # Update cumulative_data with aggregate traffic by country
+    # Distribute traffic proportionally across countries based on IP counts
+    if [ -s "$snapshot_file" ] && [ "$total_up" -gt 0 ]; then
+        # Count IPs per country
+        declare -A country_counts
+        local total_ips=0
+        
+        while IFS='|' read -r ip country; do
+            [ -z "$country" ] && continue
+            country_counts["$country"]=$((${country_counts["$country"]:-0} + 1))
+            total_ips=$((total_ips + 1))
+        done < "$snapshot_file"
+        
+        # Distribute traffic proportionally and write to cumulative_data
+        > "$cumulative_file"
+        for country in "${!country_counts[@]}"; do
+            local count=${country_counts["$country"]}
+            local proportion=$(awk "BEGIN {printf \"%.4f\", $count / $total_ips}")
+            local country_down=$(awk "BEGIN {printf \"%.0f\", $total_down * $proportion}")
+            local country_up=$(awk "BEGIN {printf \"%.0f\", $total_up * $proportion}")
+            echo "${country}|${country_down}|${country_up}" >> "$cumulative_file"
+        done
+        fix_file_ownership "$cumulative_file"
+    fi
+}
+
+# Main loop
 load_peak_connections
 while true; do
-    totals=\$(get_totals)
-    connected=\$(echo "\$totals" | cut -d'|' -f1)
-    connecting=\$(echo "\$totals" | cut -d'|' -f2)
-    if [ -n "\$connected" ] && [ "\$connected" -gt "\$_PEAK_CONNECTIONS" ] 2>/dev/null; then
-        _PEAK_CONNECTIONS=\$connected
+    # Update connection stats
+    totals=$(get_totals)
+    connected=$(echo "$totals" | cut -d'|' -f1)
+    connecting=$(echo "$totals" | cut -d'|' -f2)
+    if [ -n "$connected" ] && [ "$connected" -gt "$_PEAK_CONNECTIONS" ] 2>/dev/null; then
+        _PEAK_CONNECTIONS=$connected
         save_peak_connections
     fi
-    record_connection_history "\${connected:-0}" "\${connecting:-0}"
+    record_connection_history "${connected:-0}" "${connecting:-0}"
+    
+    # Update traffic stats (every cycle)
+    update_traffic_stats
+    
     sleep 60
 done
 EOF
@@ -2236,6 +2469,21 @@ setup_tracker_service() {
     regenerate_tracker_script
     nohup "$INSTALL_DIR/conduit-tracker.sh" >> "$TRACKER_LOG_FILE" 2>&1 &
     echo $! > "$TRACKER_PID_FILE"
+}
+
+restart_tracker() {
+    echo -e "${YELLOW}Restarting tracker...${NC}"
+    stop_tracker_service
+    sleep 1
+    regenerate_tracker_script
+    if [ "$TRACKER_ENABLED" = "true" ]; then
+        nohup "$INSTALL_DIR/conduit-tracker.sh" >> "$TRACKER_LOG_FILE" 2>&1 &
+        echo $! > "$TRACKER_PID_FILE"
+        echo -e "${GREEN}✓ Tracker restarted with updated script${NC}"
+    else
+        echo -e "${YELLOW}Tracker is disabled - not starting${NC}"
+    fi
+    sleep 1
 }
 
 toggle_tracker() {
@@ -2586,6 +2834,7 @@ ${report}"
     if telegram_send_message "$message"; then
         mkdir -p "$INSTALL_DIR/traffic_stats"
         echo "$(date +%s)" > "$INSTALL_DIR/traffic_stats/.last_report_ts"
+        fix_file_ownership "$INSTALL_DIR/traffic_stats/.last_report_ts"
         return 0
     fi
     return 1
@@ -2614,6 +2863,15 @@ export DOCKER_BIN
 [ "$TELEGRAM_ENABLED" != "true" ] && exit 0
 [ -z "$TELEGRAM_BOT_TOKEN" ] && exit 0
 [ -z "$TELEGRAM_CHAT_ID" ] && exit 0
+
+# Helper function to fix file ownership when running as root
+fix_file_ownership() {
+    local file="$1"
+    [ ! -e "$file" ] && return 0
+    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+        chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$file" 2>/dev/null || true
+    fi
+}
 
 # Cache server IP once at startup
 _server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null \
@@ -2690,6 +2948,7 @@ track_uptime() {
     local running=$($DOCKER_BIN ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" 2>/dev/null || true)
     running=${running:-0}
     echo "$(date +%s)|${running}" >> "$INSTALL_DIR/traffic_stats/uptime_log"
+    fix_file_ownership "$INSTALL_DIR/traffic_stats/uptime_log"
     # Trim to 10080 lines (7 days of per-minute entries)
     local log_file="$INSTALL_DIR/traffic_stats/uptime_log"
     local lines=$(wc -l < "$log_file" 2>/dev/null || echo 0)
@@ -2821,7 +3080,7 @@ record_snapshot() {
     local total_peers=0
     for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
         local cname=$(get_container_name $i)
-        local last_stat=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "STATS" | tail -1)
+        local last_stat=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
         local peers=$(echo "$last_stat" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
         total_peers=$((total_peers + ${peers:-0}))
     done
@@ -2829,6 +3088,7 @@ record_snapshot() {
     local total_bw=0
     [ -s "$data_file" ] && total_bw=$(awk -F'|' '{s+=$2+$3} END{print s+0}' "$data_file" 2>/dev/null)
     echo "$(date +%s)|${total_peers}|${total_bw:-0}|${running}" >> "$INSTALL_DIR/traffic_stats/report_snapshots"
+    fix_file_ownership "$INSTALL_DIR/traffic_stats/report_snapshots"
     # Trim to 720 entries
     local snap_file="$INSTALL_DIR/traffic_stats/report_snapshots"
     local lines=$(wc -l < "$snap_file" 2>/dev/null || echo 0)
@@ -2878,6 +3138,7 @@ build_summary() {
             new_countries=$(comm -23 <(echo "$current_countries") <(sort "$countries_file") 2>/dev/null | head -5 | tr '\n' ', ' | sed 's/,$//')
         fi
         echo "$current_countries" > "$countries_file"
+        fix_file_ownership "$countries_file"
     fi
 
     local msg="📋 *${period_label} Summary*"
@@ -3138,21 +3399,64 @@ build_report() {
         report+=$'\n'
     fi
 
-    # Peers (connected + connecting, matching TUI format)
+    # Peers (connected + connecting, matching TUI format) + Traffic from Docker STATS
     local total_peers=0
     local total_connecting=0
+    local total_up_bytes=0
+    local total_down_bytes=0
     for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
         local cname=$(get_container_name $i)
-        local last_stat=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "STATS" | tail -1)
+        local last_stat=$($DOCKER_BIN logs --tail 400 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        [ -z "$last_stat" ] && continue
+        
+        # Parse peers
         local peers=$(echo "$last_stat" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
         local cing=$(echo "$last_stat" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
         total_peers=$((total_peers + ${peers:-0}))
         total_connecting=$((total_connecting + ${cing:-0}))
+        
+        # Parse Up/Down and convert to bytes (e.g. "12.90 GB" -> bytes)
+        local c_up_val c_down_val
+        IFS='|' read -r c_up_val c_down_val <<< $(echo "$last_stat" | awk '{
+            up=""; down=""
+            for(j=1;j<=NF;j++){
+                if($j=="Up:"){for(k=j+1;k<=NF;k++){if($k=="|"||$k~/Down:/)break; up=up (up?" ":"") $k}}
+                else if($j=="Down:"){for(k=j+1;k<=NF;k++){if($k=="|"||$k~/Uptime:/)break; down=down (down?" ":"") $k}}
+            }
+            printf "%s|%s", up, down
+        }')
+        
+        if [ -n "$c_up_val" ]; then
+            local up_val=$(echo "$c_up_val" | awk '{print $1}')
+            local up_unit=$(echo "$c_up_val" | awk '{print $2}')
+            local up_bytes=$(awk -v val="$up_val" -v unit="$up_unit" 'BEGIN{
+                u=toupper(unit); gsub(/I/,"",u);
+                if (u ~ /^KB/) val*=1024;
+                else if (u ~ /^MB/) val*=1048576;
+                else if (u ~ /^GB/) val*=1073741824;
+                else if (u ~ /^TB/) val*=1099511627776;
+                printf "%.0f", val
+            }')
+            total_up_bytes=$((total_up_bytes + up_bytes))
+        fi
+        if [ -n "$c_down_val" ]; then
+            local down_val=$(echo "$c_down_val" | awk '{print $1}')
+            local down_unit=$(echo "$c_down_val" | awk '{print $2}')
+            local down_bytes=$(awk -v val="$down_val" -v unit="$down_unit" 'BEGIN{
+                u=toupper(unit); gsub(/I/,"",u);
+                if (u ~ /^KB/) val*=1024;
+                else if (u ~ /^MB/) val*=1048576;
+                else if (u ~ /^GB/) val*=1073741824;
+                else if (u ~ /^TB/) val*=1099511627776;
+                printf "%.0f", val
+            }')
+            total_down_bytes=$((total_down_bytes + down_bytes))
+        fi
     done
     report+="👥 Clients: ${total_peers} connected, ${total_connecting} connecting"
     report+=$'\n'
-
-    # Active unique clients
+    
+    # Active unique clients (tracker-based)
     local snapshot_file="$INSTALL_DIR/traffic_stats/tracker_snapshot"
     if [ -s "$snapshot_file" ]; then
         local active_clients=$(wc -l < "$snapshot_file" 2>/dev/null || echo 0)
@@ -3160,28 +3464,39 @@ build_report() {
         report+=$'\n'
     fi
 
-    # Total bandwidth served (all-time from cumulative_data)
+    # Total bandwidth served (all-time cumulative from tracker)
     local data_file_bw="$INSTALL_DIR/traffic_stats/cumulative_data"
     if [ -s "$data_file_bw" ]; then
         local total_bytes=$(awk -F'|' '{s+=$2+$3} END{print s+0}' "$data_file_bw" 2>/dev/null)
-        local total_served=""
         if [ "${total_bytes:-0}" -gt 0 ] 2>/dev/null; then
-            total_served=$(awk "BEGIN {b=$total_bytes; if(b>1099511627776) printf \"%.2f TB\",b/1099511627776; else if(b>1073741824) printf \"%.2f GB\",b/1073741824; else printf \"%.1f MB\",b/1048576}" 2>/dev/null)
+            local total_served=$(awk "BEGIN {b=$total_bytes; if(b>1099511627776) printf \"%.2f TB\",b/1099511627776; else if(b>1073741824) printf \"%.2f GB\",b/1073741824; else printf \"%.1f MB\",b/1048576}" 2>/dev/null)
             report+="📡 Total served: ${total_served}"
             report+=$'\n'
         fi
     fi
 
-    # CPU / RAM
-    local stats=$(timeout 10 $DOCKER_BIN stats --no-stream --format "{{.CPUPerc}} {{.MemUsage}}" $($DOCKER_BIN ps --format '{{.Names}}' 2>/dev/null | grep "^conduit") 2>/dev/null | head -1)
-    local raw_cpu=$(echo "$stats" | awk '{print $1}')
-    local cores=$(get_cpu_cores)
-    local cpu=$(awk "BEGIN {printf \"%.1f%%\", ${raw_cpu%\%} / $cores}" 2>/dev/null || echo "$raw_cpu")
-    local ram=$(echo "$stats" | awk '{print $2, $3, $4}')
-    cpu=$(escape_md "$cpu")
-    ram=$(escape_md "$ram")
-    report+="🖥 CPU: ${cpu} | RAM: ${ram}"
-    report+=$'\n'
+    # CPU / RAM - aggregate from all containers (more robust than docker stats --no-stream)
+    local total_cpu_pct=0
+    local ram_display=""
+    local stats_count=0
+    for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+        local cname=$(get_container_name $i)
+        local cstats=$(timeout 5 $DOCKER_BIN stats --no-stream --format "{{.CPUPerc}} {{.MemUsage}}" "$cname" 2>/dev/null)
+        if [ -n "$cstats" ]; then
+            local c_cpu=$(echo "$cstats" | awk '{print $1}' | tr -d '%')
+            total_cpu_pct=$(awk "BEGIN {printf \"%.2f\", ${total_cpu_pct:-0} + ${c_cpu:-0}}" 2>/dev/null)
+            [ -z "$ram_display" ] && ram_display=$(echo "$cstats" | awk '{print $2, $3, $4}')
+            stats_count=$((stats_count + 1))
+        fi
+    done
+    if [ "$stats_count" -gt 0 ]; then
+        local cores=$(get_cpu_cores)
+        local cpu=$(awk "BEGIN {printf \"%.1f%%\", ${total_cpu_pct} / $cores}" 2>/dev/null || echo "$total_cpu_pct%")
+        cpu=$(escape_md "$cpu")
+        ram_display=$(escape_md "$ram_display")
+        report+="🖥 CPU: ${cpu} | RAM: ${ram_display}"
+        report+=$'\n'
+    fi
 
     # Data usage (Linux-only interface stats; skip silently on macOS)
     if [ "${DATA_CAP_GB:-0}" -gt 0 ] 2>/dev/null; then
@@ -3228,7 +3543,7 @@ build_report() {
         fi
     fi
 
-    # Top countries by upload
+    # Top countries by upload (all-time cumulative from tracker)
     local data_file="$INSTALL_DIR/traffic_stats/cumulative_data"
     if [ -s "$data_file" ]; then
         local top_countries
@@ -3301,6 +3616,7 @@ while true; do
         build_summary "Daily" 86400
         last_daily_ts=$now_ts
         echo "$now_ts" > "$_ts_dir/.last_daily_ts"
+        fix_file_ownership "$_ts_dir/.last_daily_ts"
     fi
 
     # Weekly summary (wall-clock, survives restarts)
@@ -3308,6 +3624,7 @@ while true; do
         build_summary "Weekly" 604800
         last_weekly_ts=$now_ts
         echo "$now_ts" > "$_ts_dir/.last_weekly_ts"
+        fix_file_ownership "$_ts_dir/.last_weekly_ts"
     fi
 
     # Regular periodic report (wall-clock aligned to start hour)
@@ -3326,6 +3643,7 @@ while true; do
             record_snapshot
             last_report_ts=$now_ts
             echo "$now_ts" > "$_ts_dir/.last_report_ts"
+            fix_file_ownership "$_ts_dir/.last_report_ts"
         fi
     fi
 done
@@ -3870,11 +4188,16 @@ show_dashboard() {
             printf "\033[J"
         fi
         
-        # Wait 4 seconds for keypress (compensating for processing time)
-        # Redirect from /dev/tty ensures it works when the script is piped
-        if read -t 1 -n 1 -s <> /dev/tty 2>/dev/null; then
-            stop_dashboard=1
-        fi
+        # Wait for keypress with multiple short intervals for better responsiveness
+        # Total ~5 second refresh, but checks for input every 0.2s
+        local waited=0
+        while [ $waited -lt 25 ] && [ $stop_dashboard -eq 0 ]; do
+            if read -t 0.2 -n 1 -s <> /dev/tty 2>/dev/null; then
+                stop_dashboard=1
+                break
+            fi
+            waited=$((waited + 1))
+        done
     done
     
     echo -ne "\033[?25h" # Show cursor
@@ -3944,9 +4267,15 @@ show_container_dashboard() {
             printf "\033[J"
         fi
 
-        if read -t 1 -n 1 -s <> /dev/tty 2>/dev/null; then
-            stop_dashboard=1
-        fi
+        # Wait for keypress with multiple short intervals for better responsiveness
+        local waited=0
+        while [ $waited -lt 25 ] && [ $stop_dashboard -eq 0 ]; do
+            if read -t 0.2 -n 1 -s <> /dev/tty 2>/dev/null; then
+                stop_dashboard=1
+                break
+            fi
+            waited=$((waited + 1))
+        done
     done
 
     echo -ne "\033[?25h"
@@ -4138,35 +4467,37 @@ format_bytes_compact() {
     fi
 }
 
-# show_peers() - Live peer traffic by country using tcpdump + GeoIP
-# On macOS requires sudo (tcpdump); menu and CLI still offer it, Telegram does not.
+# show_peers() - Live peer traffic by country using Docker /proc/net/tcp + GeoIP
+# Works without sudo on macOS
 show_peers() {
-    # Flag to control the main loop - set to 1 on user interrupt
-    local stop_peers=0
-    trap 'stop_peers=1' SIGINT SIGTERM
-
     local is_darwin=0
     [ "$(uname -s 2>/dev/null)" = "Darwin" ] && is_darwin=1
 
-    # Verify required dependencies are installed
-    # macOS requires sudo for tcpdump; enforce it for this feature.
-    if [ $is_darwin -eq 1 ] && [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}Error: Viewing peers by country requires elevated privileges on macOS (tcpdump).${NC}"
-        echo "Run: sudo conduit peers"
+    # On macOS, inform user that Live Map is not available but alternatives exist
+    if [ $is_darwin -eq 1 ]; then
+        clear
+        print_header
+        echo -e "${YELLOW}═══ LIVE PEER MAP ═══${NC}"
         echo ""
-        read -p "Run with sudo now? [y/N] " yn < /dev/tty || true
-        case "$yn" in
-            y|Y) exec sudo -E "$0" peers ;;
-        esac
-        read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
-        return 1
+        echo -e "${CYAN}The live peer map uses real-time packet capture which requires${NC}"
+        echo -e "${CYAN}elevated privileges (sudo + tcpdump) on macOS.${NC}"
+        echo ""
+        echo -e "${GREEN}✓ Your tracker is already collecting peer data in the background!${NC}"
+        echo ""
+        echo -e "${BOLD}To view peer statistics by country:${NC}"
+        echo -e "  • ${CYAN}Telegram Bot${NC}: Send ${BOLD}/status${NC} command"
+        echo -e "  • ${CYAN}Dashboard${NC}: Press ${BOLD}1${NC} from main menu"
+        echo ""
+        echo -e "${YELLOW}Note: Traffic data is updated every minute by the background tracker.${NC}"
+        echo ""
+        read -n 1 -s -r -p "Press any key to return to menu..." < /dev/tty || true
+        return 0
     fi
 
-    if ! command -v tcpdump &>/dev/null; then
-        echo -e "${RED}Error: tcpdump not found!${NC}"
-        read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
-        return 1
-    fi
+    # Linux version continues with tcpdump-based live map
+    # Flag to control the main loop - set to 1 on user interrupt
+    local stop_peers=0
+    trap 'stop_peers=1' SIGINT SIGTERM
 
     # GeoIP backend: require either geoiplookup (Linux) or mmdblookup+DB (macOS)
     if ! command -v geoiplookup &>/dev/null; then
@@ -4601,6 +4932,11 @@ show_peers() {
             for country in "${!cumul_from[@]}"; do
                 echo "${country}|${cumul_from[$country]}|${cumul_to[$country]}" >> "$persist_dir/cumulative_data"
             done
+            
+            # Fix ownership if running as root (preserve user ownership for tracker)
+            if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+                chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$persist_dir/cumulative_data" 2>/dev/null || true
+            fi
 
             # Update cumulative IP tracking (add new IPs seen this cycle)
             for ip in "${!ip_to_country[@]}"; do
@@ -4610,6 +4946,11 @@ show_peers() {
                     echo "${country}|${ip}" >> "$persist_dir/cumulative_ips"
                 fi
             done
+            
+            # Fix ownership if running as root (preserve user ownership for tracker)
+            if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+                chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$persist_dir/cumulative_ips" 2>/dev/null || true
+            fi
 
             # Count total unique IPs per country (cumulative)
             unset total_ips_count
@@ -4724,6 +5065,7 @@ save_peak_connections() {
     mkdir -p "$(dirname "$PEAK_CONNECTIONS_FILE")" 2>/dev/null
     echo "$_PEAK_CONTAINER_START" > "$PEAK_CONNECTIONS_FILE"
     echo "$_PEAK_CONNECTIONS" >> "$PEAK_CONNECTIONS_FILE"
+    fix_file_ownership "$PEAK_CONNECTIONS_FILE"
 }
 
 # Connection history container tracking (resets when containers restart)
@@ -4776,6 +5118,7 @@ record_connection_history() {
     if [ -f "$CONNECTION_HISTORY_FILE" ]; then
         awk -F'|' -v cutoff="$cutoff" '$1 >= cutoff' "$CONNECTION_HISTORY_FILE" > "${CONNECTION_HISTORY_FILE}.tmp" 2>/dev/null
         mv -f "${CONNECTION_HISTORY_FILE}.tmp" "$CONNECTION_HISTORY_FILE" 2>/dev/null
+        fix_file_ownership "$CONNECTION_HISTORY_FILE"
     fi
 }
 
@@ -4937,7 +5280,7 @@ show_status() {
             if ! docker ps 2>/dev/null | grep -q "[[:space:]]${cname}$"; then
                 continue
             fi
-            local logs=$(docker logs --tail 200 "$cname" 2>&1 | grep "STATS" | tail -1)
+            local logs=$(docker logs --tail 200 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
             if [ -z "$logs" ]; then
                 continue
             fi
