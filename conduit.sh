@@ -1193,14 +1193,6 @@ save_settings() {
     TRACKER_ENABLED=${TRACKER_ENABLED:-true}
     TRACKER_PID_FILE="$INSTALL_DIR/tracker.pid"
     TRACKER_LOG_FILE="$INSTALL_DIR/tracker.log"
-    TELEGRAM_START_HOUR=${TELEGRAM_START_HOUR:-0}
-    TELEGRAM_ALERTS_ENABLED=${TELEGRAM_ALERTS_ENABLED:-true}
-    TELEGRAM_DAILY_SUMMARY=${TELEGRAM_DAILY_SUMMARY:-true}
-    TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
-    PERSIST_DIR="$INSTALL_DIR/traffic_stats"
-    CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
-    CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
-    PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
     
     local _tmp="$INSTALL_DIR/settings.conf.tmp.$$"
     cat > "$_tmp" << EOF
@@ -1373,7 +1365,7 @@ TELEGRAM_START_HOUR=${TELEGRAM_START_HOUR:-0}
     TELEGRAM_SERVER_LABEL="${TELEGRAM_SERVER_LABEL:-}"
 TELEGRAM_ALERTS_ENABLED=${TELEGRAM_ALERTS_ENABLED:-true}
 TELEGRAM_DAILY_SUMMARY=${TELEGRAM_DAILY_SUMMARY:-true}
-TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
+    TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
     PERSIST_DIR="$INSTALL_DIR/traffic_stats"
     mkdir -p "$PERSIST_DIR" 2>/dev/null || true
     if [ ! -w "$PERSIST_DIR" ]; then
@@ -1384,14 +1376,6 @@ TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
         PERSIST_DIR="/tmp/conduit-traffic-${USER:-user}"
         mkdir -p "$PERSIST_DIR" 2>/dev/null || true
     fi
-    CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
-    CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
-    PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
-    PERSIST_DIR="$INSTALL_DIR/traffic_stats"
-    CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
-    CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
-    PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
-    PERSIST_DIR="$INSTALL_DIR/traffic_stats"
     CONNECTION_HISTORY_FILE="$PERSIST_DIR/connection_history"
     CONNECTION_HISTORY_START_FILE="$PERSIST_DIR/connection_history_start"
     PEAK_CONNECTIONS_FILE="$PERSIST_DIR/peak_connections"
@@ -2012,6 +1996,7 @@ get_container_memory() {
 }
 
 sync_settings_from_containers() {
+    local should_save="${1:-true}"  # Allow caller to control whether to save
     if ! command -v docker &>/dev/null; then
         return 0
     fi
@@ -2028,7 +2013,12 @@ sync_settings_from_containers() {
     done
     [ "$detected" -lt 1 ] && return 0
 
+    local old_count="$CONTAINER_COUNT"
     CONTAINER_COUNT="$detected"
+    local settings_changed=false
+    
+    # Track if container count changed
+    [ "$old_count" != "$CONTAINER_COUNT" ] && settings_changed=true
 
     local mc_default=""
     local bw_default=""
@@ -2047,28 +2037,38 @@ sync_settings_from_containers() {
         if [ "$i" -eq 1 ]; then
             mc_default="$mc"
             bw_default="$bw"
+            [ "$MAX_CLIENTS" != "$mc" ] && settings_changed=true
+            [ "$BANDWIDTH" != "$bw" ] && settings_changed=true
             MAX_CLIENTS="$mc"
             BANDWIDTH="$bw"
         else
+            local old_mc="${!MAX_CLIENTS_${i}}"
+            local old_bw="${!BANDWIDTH_${i}}"
             if [ "$mc" != "$mc_default" ]; then
-                eval "MAX_CLIENTS_${i}=${mc}"
+                [ "$old_mc" != "$mc" ] && settings_changed=true
+                printf -v "MAX_CLIENTS_${i}" "%s" "$mc"
             else
+                [ -n "$old_mc" ] && settings_changed=true
                 unset "MAX_CLIENTS_${i}" 2>/dev/null || true
             fi
             if [ "$bw" != "$bw_default" ]; then
-                eval "BANDWIDTH_${i}=${bw}"
+                [ "$old_bw" != "$bw" ] && settings_changed=true
+                printf -v "BANDWIDTH_${i}" "%s" "$bw"
             else
+                [ -n "$old_bw" ] && settings_changed=true
                 unset "BANDWIDTH_${i}" 2>/dev/null || true
             fi
         fi
     done
 
-    if command -v save_settings >/dev/null 2>&1; then
-        save_settings
-    else
-        local settings_path="$INSTALL_DIR/settings.conf"
-        local tmp="${settings_path}.tmp.$$"
-        cat > "$tmp" << EOF
+    # Only save if settings changed and caller wants to save
+    if [ "$should_save" = "true" ] && [ "$settings_changed" = "true" ]; then
+        if command -v save_settings >/dev/null 2>&1; then
+            save_settings
+        else
+            local settings_path="$INSTALL_DIR/settings.conf"
+            local tmp="${settings_path}.tmp.$$"
+            cat > "$tmp" << EOF
 MAX_CLIENTS=$MAX_CLIENTS
 BANDWIDTH=$BANDWIDTH
 CONTAINER_COUNT=$CONTAINER_COUNT
@@ -2093,6 +2093,7 @@ EOF
             [ -n "${!bw_var}" ] && echo "${bw_var}=${!bw_var}" >> "$tmp"
         done
         mv "$tmp" "$settings_path"
+        fi
     fi
 }
 
@@ -2537,6 +2538,15 @@ CONTAINER_PORT_BASE=$CONTAINER_PORT_BASE
 DOCKER_CPUS=${DOCKER_CPUS:-}
 DOCKER_MEMORY=${DOCKER_MEMORY:-}
 TRACKER_ENABLED=${TRACKER_ENABLED:-true}
+TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID"
+TELEGRAM_INTERVAL=${TELEGRAM_INTERVAL:-6}
+TELEGRAM_START_HOUR=${TELEGRAM_START_HOUR:-0}
+TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
+TELEGRAM_SERVER_LABEL="${TELEGRAM_SERVER_LABEL:-}"
+TELEGRAM_ALERTS_ENABLED=${TELEGRAM_ALERTS_ENABLED:-true}
+TELEGRAM_DAILY_SUMMARY=${TELEGRAM_DAILY_SUMMARY:-true}
+TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
 EOF
             for i in $(seq 1 "$CONTAINER_COUNT"); do
                 local mc_var="MAX_CLIENTS_${i}"
@@ -2843,7 +2853,7 @@ ${report}"
 
 telegram_generate_notify_script() {
     cat > "$INSTALL_DIR/telegram_notify.sh" << 'TGEOF'
-#!/bin/bash
+#!/opt/homebrew/bin/bash
 # Conduit Telegram Notification Service
 # Runs as a background process, sends periodic status reports
 
@@ -3007,15 +3017,34 @@ check_alerts() {
 
     # CPU + RAM check (single docker stats call)
     local conduit_containers=$($DOCKER_BIN ps --format '{{.Names}}' 2>/dev/null | grep "^conduit" 2>/dev/null || true)
-    local stats_line=""
+    local stats_lines=""
     if [ -n "$conduit_containers" ]; then
-        stats_line=$(timeout 10 $DOCKER_BIN stats --no-stream --format "{{.CPUPerc}} {{.MemPerc}}" $conduit_containers 2>/dev/null | head -1)
+        stats_lines=$(timeout 10 $DOCKER_BIN stats --no-stream --format "{{.CPUPerc}} {{.MemPerc}}" $conduit_containers 2>/dev/null)
     fi
-    local raw_cpu=$(echo "$stats_line" | awk '{print $1}')
-    local ram_pct=$(echo "$stats_line" | awk '{print $2}')
-
+    
+    # Sum CPU across all containers, find max RAM
+    local total_cpu=0
+    local max_ram=0
     local cores=$(get_cpu_cores)
-    local cpu_val=$(awk "BEGIN {printf \"%.0f\", ${raw_cpu%\%} / $cores}" 2>/dev/null || echo 0)
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local raw_cpu=$(echo "$line" | awk '{print $1}')
+        local ram_pct=$(echo "$line" | awk '{print $2}')
+        
+        # Remove % and accumulate CPU
+        local cpu_num=${raw_cpu%\%}
+        total_cpu=$(awk "BEGIN {print $total_cpu + ${cpu_num:-0}}" 2>/dev/null || echo "$total_cpu")
+        
+        # Track max RAM
+        local ram_num=${ram_pct%\%}
+        ram_num=${ram_num%%.*}
+        if [ "${ram_num:-0}" -gt "$max_ram" ] 2>/dev/null; then
+            max_ram=$ram_num
+        fi
+    done <<< "$stats_lines"
+    
+    # Normalize total CPU by number of cores
+    local cpu_val=$(awk "BEGIN {printf \"%.0f\", $total_cpu / $cores}" 2>/dev/null || echo 0)
     if [ "${cpu_val:-0}" -gt 90 ] 2>/dev/null; then
         cpu_breach=$((cpu_breach + 1))
     else
@@ -3028,16 +3057,14 @@ CPU usage at ${cpu_val}% for 3\+ minutes"
         cpu_breach=0
     fi
 
-    local ram_val=${ram_pct%\%}
-    ram_val=${ram_val%%.*}
-    if [ "${ram_val:-0}" -gt 90 ] 2>/dev/null; then
+    if [ "${max_ram:-0}" -gt 90 ] 2>/dev/null; then
         ram_breach=$((ram_breach + 1))
     else
         ram_breach=0
     fi
     if [ "$ram_breach" -ge 3 ] && [ $((now - last_alert_ram)) -ge $cooldown ] 2>/dev/null; then
         telegram_send "⚠️ *Alert: High RAM*
-Memory usage at ${ram_pct} for 3\+ minutes"
+Memory usage at ${max_ram}% for 3\+ minutes"
         last_alert_ram=$now
         ram_breach=0
     fi
@@ -3803,6 +3830,14 @@ show_telegram_menu() {
                     echo -e "  Leave blank to use hostname ($(hostname 2>/dev/null || echo 'unknown'))"
                     echo ""
                     read -p "  New label: " new_label < /dev/tty || true
+                    # Sanitize label to prevent shell injection
+                    if [ -n "$new_label" ]; then
+                        if ! [[ "$new_label" =~ ^[A-Za-z0-9\ _.\-]+$ ]]; then
+                            echo -e "  ${RED}✗ Invalid label. Only letters, numbers, spaces, underscores, dots, and hyphens are allowed.${NC}"
+                            read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
+                            continue
+                        fi
+                    fi
                     TELEGRAM_SERVER_LABEL="${new_label}"
                     save_settings
                     telegram_start_notify
@@ -5410,7 +5445,7 @@ get_net_speed() {
 }
 
 show_status() {
-    sync_settings_from_containers
+    sync_settings_from_containers false  # Don't save during live status updates
     local mode="${1:-normal}" # 'live' mode adds line clearing
     local EL=""
     if [ "$mode" == "live" ]; then
